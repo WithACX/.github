@@ -1,0 +1,24 @@
+name: Documentation
+description: Improvements or additions to documentation
+labels: ["documentation"]
+type: Task
+body:
+  - type: markdown
+    attributes:
+      value: |
+        For docs gaps, errors, or additions. If this is really a code bug, use the
+        bug report instead.
+  - type: input
+    id: location
+    attributes:
+      label: Where
+      description: File, page, or section that needs work.
+    validations:
+      required: true
+  - type: textarea
+    id: change
+    attributes:
+      label: What needs to change
+      description: What is missing, wrong, or unclear, and what it should say.
+    validations:
+      required: true

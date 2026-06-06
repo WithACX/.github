@@ -1,0 +1,10 @@
+# Issue template chooser config.
+# blank_issues_enabled is true so there is always an escape hatch for items that
+# do not fit a form. Per-repo setup may add a Discussions contact_link (absolute
+# URL required by GitHub), e.g. for questions; left out of the default to avoid
+# shipping a broken URL org-wide.
+blank_issues_enabled: true
+# contact_links:
+#   - name: Question or discussion
+#     url: https://github.com/withACX/<repo>/discussions
+#     about: For open-ended questions, start a discussion instead of an issue.

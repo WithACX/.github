@@ -1,0 +1,29 @@
+name: Feature request
+description: New feature or enhancement request
+labels: ["feature request"]
+type: Feature
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Describe the outcome you want, not just the implementation. Maintainers
+        confirm priority and area.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or opportunity
+      description: What are you trying to achieve, and why does it matter now?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: What you have in mind. Alternatives welcome.
+    validations:
+      required: true
+  - type: textarea
+    id: scope
+    attributes:
+      label: Out of scope
+      description: Anything this should explicitly not cover.

@@ -1,0 +1,30 @@
+name: Bug report
+description: Something isn't working
+labels: ["bug"]
+type: Bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. Fill in what you can; partial reports are still useful.
+        For a duplicate or out-of-scope item, prefix the title with `[DUPLICATE]` or
+        `[INVALID]` and apply `wontfix` instead.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you did and what went wrong.
+      placeholder: Steps to reproduce, then the actual result.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: Version, OS, and repo.
