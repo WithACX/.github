@@ -1,5 +1,6 @@
 name: Documentation
 description: Improvements or additions to documentation
+title: "[DOCS] "
 labels: ["documentation"]
 type: Task
 body:
