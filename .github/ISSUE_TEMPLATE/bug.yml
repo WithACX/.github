@@ -1,5 +1,6 @@
 name: Bug report
 description: Something isn't working
+title: "[BUG] "
 labels: ["bug"]
 type: Bug
 body:
@@ -7,8 +8,8 @@ body:
     attributes:
       value: |
         Thanks for the report. Fill in what you can; partial reports are still useful.
-        For a duplicate or out-of-scope item, prefix the title with `[DUPLICATE]` or
-        `[INVALID]` and apply `wontfix` instead.
+        Keep the `[BUG]` title prefix. For a duplicate or out-of-scope item,
+        prefix the title with `[DUPLICATE]` or `[INVALID]` and apply `wontfix` instead.
   - type: textarea
     id: what-happened
     attributes:
