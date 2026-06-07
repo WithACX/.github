@@ -1,0 +1,319 @@
+name: Status-sync
+
+# Enforces label/board lifecycle transitions so no actor (Claude Code,
+# Copilot, GitHub UI, humans) can silently skip them. Three triggers:
+#
+#   1. PR opened referencing an issue via closing keywords
+#      (Closes/Fixes/Resolves #N) -- swap status:draft -> status:ready,
+#      add a warning comment, and move board Status: Todo -> In Progress.
+#
+#   2. Issue closed while still carrying status:draft -- replace with
+#      status:ready and warn. Draft must never be the final label state
+#      of delivered work.
+#
+#   3. Priority label (priority:*) added to a non-parked-idea issue that
+#      still carries status:draft -- remove status:draft per the triage
+#      lifecycle. Parked-idea signature (milestone + investigate) is
+#      skipped; those are intentional.
+#
+# Board Status writes (trigger 1) require a PAT with the `project` scope
+# stored as the STATUS_SYNC_PAT Actions secret. If the secret is absent,
+# label transitions still execute and a skip notice is logged.
+# See knowledge/token-registry.md -- STATUS_SYNC_PAT for setup steps.
+
+on:
+  pull_request:
+    types: [opened, ready_for_review]
+  issues:
+    types: [closed, labeled]
+
+permissions:
+  issues: write
+  pull-requests: read
+
+jobs:
+  # ------------------------------------------------------------------
+  # Job 1: PR opened -- clear status:draft and move board to In Progress
+  # ------------------------------------------------------------------
+  pr-linked-in-progress:
+    name: PR linked issue -- clear draft + board In Progress
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Update linked issues
+        env:
+          STATUS_SYNC_PAT: ${{ secrets.STATUS_SYNC_PAT }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          python3 - <<'PYEOF'
+          import json, os, subprocess, sys
+
+          repo = os.environ["REPO"]
+          pr_number = int(os.environ["PR_NUMBER"])
+          pat = os.environ.get("STATUS_SYNC_PAT", "")
+          owner, name = repo.split("/")
+
+          # Fetch closing-issue references via GraphQL
+          query = f"""
+          query {{
+            repository(owner: "{owner}", name: "{name}") {{
+              pullRequest(number: {pr_number}) {{
+                closingIssuesReferences(first: 20) {{
+                  nodes {{
+                    number
+                    labels(first: 30) {{ nodes {{ name }} }}
+                    projectItems(first: 5) {{
+                      nodes {{
+                        id
+                        project {{ id title }}
+                        fieldValueByName(name: "Status") {{
+                          ... on ProjectV2ItemFieldSingleSelectValue {{
+                            name optionId
+                          }}
+                        }}
+                      }}
+                    }}
+                  }}
+                }}
+              }}
+            }}
+          }}
+          """
+          r = subprocess.run(
+              ["gh", "api", "graphql", "-f", f"query={query}"],
+              capture_output=True, text=True,
+          )
+          if r.returncode != 0:
+              print(f"GraphQL error: {r.stderr}", file=sys.stderr)
+              sys.exit(0)  # never block the PR
+
+          issues = (
+              json.loads(r.stdout)
+              .get("data", {})
+              .get("repository", {})
+              .get("pullRequest", {})
+              .get("closingIssuesReferences", {})
+              .get("nodes", [])
+          )
+
+          for issue in issues:
+              issue_num = issue["number"]
+              labels = [l["name"] for l in issue["labels"]["nodes"]]
+              print(f"Linked issue #{issue_num}: labels={labels}")
+
+              # 1a. Clear status:draft -> status:ready
+              if "status:draft" in labels:
+                  subprocess.run(
+                      ["gh", "issue", "edit", str(issue_num),
+                       "--repo", repo,
+                       "--remove-label", "status:draft",
+                       "--add-label", "status:ready"],
+                      check=False,
+                  )
+                  subprocess.run(
+                      ["gh", "issue", "comment", str(issue_num),
+                       "--repo", repo,
+                       "--body",
+                       f"PR #{pr_number} references this issue. "
+                       "Promoted from `status:draft` to `status:ready` automatically."],
+                      check=False,
+                  )
+                  print(f"  #{issue_num}: status:draft -> status:ready")
+
+              # 1b. Board Status: Todo -> In Progress (requires STATUS_SYNC_PAT)
+              if not pat:
+                  print(
+                      f"  #{issue_num}: STATUS_SYNC_PAT secret not configured -- "
+                      "board status update skipped. "
+                      "See knowledge/token-registry.md (STATUS_SYNC_PAT) to activate."
+                  )
+                  continue
+
+              for item in issue.get("projectItems", {}).get("nodes", []):
+                  status_val = item.get("fieldValueByName") or {}
+                  if status_val.get("name") != "Todo":
+                      continue
+                  item_id = item["id"]
+                  project_id = item["project"]["id"]
+
+                  # Discover Status field and In Progress option ID
+                  field_q = f"""
+                  query {{
+                    node(id: "{project_id}") {{
+                      ... on ProjectV2 {{
+                        fields(first: 20) {{
+                          nodes {{
+                            ... on ProjectV2SingleSelectField {{
+                              id name
+                              options {{ id name }}
+                            }}
+                          }}
+                        }}
+                      }}
+                    }}
+                  }}
+                  """
+                  fr = subprocess.run(
+                      ["gh", "api", "graphql",
+                       "-H", f"Authorization: token {pat}",
+                       "-f", f"query={field_q}"],
+                      capture_output=True, text=True,
+                  )
+                  if fr.returncode != 0:
+                      print(f"  Field query failed: {fr.stderr}", file=sys.stderr)
+                      continue
+                  fields = (
+                      json.loads(fr.stdout)
+                      .get("data", {})
+                      .get("node", {})
+                      .get("fields", {})
+                      .get("nodes", [])
+                  )
+                  status_field = next(
+                      (f for f in fields if f.get("name") == "Status"), None
+                  )
+                  if not status_field:
+                      continue
+                  in_progress_opt = next(
+                      (o for o in status_field.get("options", [])
+                       if o["name"] == "In Progress"),
+                      None,
+                  )
+                  if not in_progress_opt:
+                      continue
+
+                  mutation = f"""
+                  mutation {{
+                    updateProjectV2ItemFieldValue(input: {{
+                      projectId: "{project_id}"
+                      itemId: "{item_id}"
+                      fieldId: "{status_field['id']}"
+                      value: {{ singleSelectOptionId: "{in_progress_opt['id']}" }}
+                    }}) {{ projectV2Item {{ id }} }}
+                  }}
+                  """
+                  mr = subprocess.run(
+                      ["gh", "api", "graphql",
+                       "-H", f"Authorization: token {pat}",
+                       "-f", f"query={mutation}"],
+                      capture_output=True, text=True,
+                  )
+                  if mr.returncode == 0:
+                      print(f"  #{issue_num}: board Status -> In Progress")
+                  else:
+                      print(f"  #{issue_num}: board update failed: {mr.stderr}",
+                            file=sys.stderr)
+          PYEOF
+
+  # ------------------------------------------------------------------
+  # Job 2: Issue closed while status:draft -- replace with status:ready
+  # ------------------------------------------------------------------
+  issue-closed-draft-cleanup:
+    name: Issue closed -- clear status:draft
+    if: github.event_name == 'issues' && github.event.action == 'closed'
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Remove status:draft from closed issue
+        env:
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          ISSUE_LABELS: ${{ toJson(github.event.issue.labels) }}
+          REPO: ${{ github.repository }}
+        run: |
+          python3 - <<'PYEOF'
+          import json, os, subprocess, sys
+
+          repo = os.environ["REPO"]
+          issue_num = os.environ["ISSUE_NUMBER"]
+          labels = [l["name"] for l in json.loads(os.environ["ISSUE_LABELS"])]
+
+          if "status:draft" not in labels:
+              print("No status:draft -- nothing to do.")
+              sys.exit(0)
+
+          subprocess.run(
+              ["gh", "issue", "edit", issue_num,
+               "--repo", repo,
+               "--remove-label", "status:draft",
+               "--add-label", "status:ready"],
+              check=False,
+          )
+          subprocess.run(
+              ["gh", "issue", "comment", issue_num,
+               "--repo", repo,
+               "--body",
+               "**Status cleanup:** Issue closed while still labeled `status:draft`. "
+               "Replaced with `status:ready` -- draft must never be the final label "
+               "state of delivered work."],
+              check=False,
+          )
+          print(f"Issue #{issue_num}: status:draft -> status:ready on close")
+          PYEOF
+
+  # ------------------------------------------------------------------
+  # Job 3: Priority label added -- clear status:draft (non-parked ideas)
+  # ------------------------------------------------------------------
+  priority-label-draft-cleanup:
+    name: Priority label added -- clear status:draft
+    if: |
+      github.event_name == 'issues' &&
+      github.event.action == 'labeled' &&
+      startsWith(github.event.label.name, 'priority:')
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Remove status:draft when priority added to non-parked issue
+        env:
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          ISSUE_LABELS: ${{ toJson(github.event.issue.labels) }}
+          ISSUE_MILESTONE: ${{ toJson(github.event.issue.milestone) }}
+          REPO: ${{ github.repository }}
+        run: |
+          python3 - <<'PYEOF'
+          import json, os, subprocess, sys
+
+          repo = os.environ["REPO"]
+          issue_num = os.environ["ISSUE_NUMBER"]
+          labels = [l["name"] for l in json.loads(os.environ["ISSUE_LABELS"])]
+          milestone_raw = os.environ.get("ISSUE_MILESTONE", "null")
+          milestone = json.loads(milestone_raw) if milestone_raw and milestone_raw != "null" else None
+          has_milestone = bool(milestone and milestone.get("title"))
+
+          if "status:draft" not in labels:
+              print("No status:draft -- nothing to do.")
+              sys.exit(0)
+
+          # Parked-idea signature: milestone + investigate label.
+          # If this matches, a human is intentionally promoting a parked idea;
+          # skip the auto-clear so the promotion stays deliberate.
+          is_parked_idea = has_milestone and "investigate" in labels
+          if is_parked_idea:
+              print(
+                  f"Issue #{issue_num} matches parked-idea signature "
+                  "(milestone + investigate label). Skipping auto-clear -- "
+                  "human is intentionally promoting."
+              )
+              sys.exit(0)
+
+          subprocess.run(
+              ["gh", "issue", "edit", issue_num,
+               "--repo", repo,
+               "--remove-label", "status:draft"],
+              check=False,
+          )
+          subprocess.run(
+              ["gh", "issue", "comment", issue_num,
+               "--repo", repo,
+               "--body",
+               "**Status cleanup:** Priority label added -- `status:draft` removed "
+               "per triage lifecycle. The issue is untriaged (no status label). "
+               "Add `status:ready` when it is ready to execute."],
+              check=False,
+          )
+          print(f"Issue #{issue_num}: status:draft removed after priority label added")
+          PYEOF
