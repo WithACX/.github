@@ -1,5 +1,6 @@
 name: Feature request
 description: New feature or enhancement request
+title: "[FEAT] "
 labels: ["feature request"]
 type: Feature
 body:
@@ -7,7 +8,7 @@ body:
     attributes:
       value: |
         Describe the outcome you want, not just the implementation. Maintainers
-        confirm priority and area.
+        confirm priority and area. Keep the `[FEAT]` title prefix.
   - type: textarea
     id: problem
     attributes:
