@@ -1,0 +1,160 @@
+name: Template-conformance check
+
+# Server-side backstop for the "Issue Bodies Follow the Templates" rule
+# (github skill SKILL.md). Issue forms only apply in the GitHub web UI;
+# this workflow fires on every issue creation regardless of actor (gh CLI,
+# API, Claude Code, Copilot, scripts) and flags non-conforming bodies.
+#
+# On mismatch: applies the `needs-template` marker label and posts a comment
+# with a link to the matching template. Never auto-closes or auto-rewrites.
+#
+# Skips: issues from the Actions runner itself (avoids loops), and types
+# that have no structured template (investigate, wontfix, blank issues).
+#
+# Distribute via the org-defaults path (withACX/.github, ADR-0055).
+
+on:
+  issues:
+    types: [opened]
+
+permissions:
+  issues: write
+
+jobs:
+  check-template:
+    name: Check issue body against template headings
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Evaluate conformance and flag if needed
+        env:
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          ISSUE_BODY: ${{ github.event.issue.body }}
+          ISSUE_LABELS: ${{ toJson(github.event.issue.labels) }}
+          ISSUE_ACTOR: ${{ github.event.issue.user.login }}
+          REPO: ${{ github.repository }}
+        run: |
+          python3 - <<'PYEOF'
+          import json, os, re, subprocess, sys
+
+          repo = os.environ["REPO"]
+          issue_num = os.environ["ISSUE_NUMBER"]
+          body = os.environ.get("ISSUE_BODY", "") or ""
+          labels_raw = os.environ.get("ISSUE_LABELS", "[]")
+          actor = os.environ.get("ISSUE_ACTOR", "")
+
+          # Skip the workflow's own bot to avoid infinite label loops.
+          SKIP_ACTORS = {"github-actions[bot]", "dependabot[bot]"}
+          if actor in SKIP_ACTORS:
+              print(f"Actor {actor!r} is on the skip list. Nothing to do.")
+              sys.exit(0)
+
+          labels = [l["name"] for l in json.loads(labels_raw)]
+          print(f"Issue #{issue_num} | actor={actor} | labels={labels}")
+
+          # Map type label -> (required headings, template file name, friendly type)
+          # Headings are the `label:` values in the .yml form fields.
+          TEMPLATE_MAP = {
+              "bug": (
+                  ["What happened", "What you expected"],
+                  "bug.yml",
+                  "Bug report",
+              ),
+              "feature request": (
+                  ["Problem or opportunity", "Proposed solution"],
+                  "feature-request.yml",
+                  "Feature request",
+              ),
+              "documentation": (
+                  ["Where", "What needs to change"],
+                  "documentation.yml",
+                  "Documentation",
+              ),
+              "investigate": (
+                  ["What to investigate", "Why it matters", "Definition of done"],
+                  "investigate.yml",
+                  "Investigate",
+              ),
+          }
+
+          matched_type = None
+          for label in labels:
+              if label.lower() in TEMPLATE_MAP:
+                  matched_type = label.lower()
+                  break
+
+          if matched_type is None:
+              print(f"No structured template for labels {labels}. Skipping.")
+              sys.exit(0)
+
+          required_headings, template_file, type_name = TEMPLATE_MAP[matched_type]
+          print(f"Type: {type_name} | Required headings: {required_headings}")
+
+          # Check for required headings -- match ## or ### Heading (case-insensitive).
+          # GitHub issue forms render labels as ### (H3) headings in the body;
+          # manually crafted bodies may use ## (H2). Both are conforming.
+          def has_heading(text: str, heading: str) -> bool:
+              pattern = rf"^#{{2,3}}\s+{re.escape(heading)}\s*$"
+              return bool(re.search(pattern, text, re.IGNORECASE | re.MULTILINE))
+
+          # Feature-request label is also used for task sub-issues (A-CX has no
+          # task type label). Accept the canonical task body shape as conforming
+          # so Task sub-issues with ## Scope + ## Acceptance criteria are not
+          # false-flagged as missing feature-request headings.
+          if matched_type == "feature request":
+              task_headings = ["Scope", "Acceptance criteria"]
+              if all(has_heading(body, h) for h in task_headings):
+                  print("Task sub-issue shape detected (Scope + Acceptance criteria). Conforms.")
+                  sys.exit(0)
+
+          missing = [h for h in required_headings if not has_heading(body, h)]
+
+          if not missing:
+              print("All required headings present. Issue conforms to template.")
+              sys.exit(0)
+
+          # Non-conforming: ensure the needs-template label exists, apply it,
+          # and post a comment.
+          print(f"Missing headings: {missing}")
+
+          # Create label if absent (idempotent via --force).
+          subprocess.run(
+              ["gh", "label", "create", "needs-template",
+               "--repo", repo,
+               "--color", "E4E669",
+               "--description", "Issue body does not follow the type template",
+               "--force"],
+              capture_output=True,
+          )
+
+          subprocess.run(
+              ["gh", "issue", "edit", issue_num, "--repo", repo,
+               "--add-label", "needs-template"],
+              capture_output=True,
+          )
+
+          owner, name = repo.split("/")
+          template_url = (
+              f"https://github.com/{owner}/{name}/blob/main/"
+              f".github/ISSUE_TEMPLATE/{template_file}"
+          )
+          missing_list = "\n".join(f"- `## {h}`" for h in missing)
+          comment = (
+              f"**Template check:** this {type_name.lower()} issue is missing "
+              f"the following section heading(s):\n\n"
+              f"{missing_list}\n\n"
+              f"Please restructure the body to match the "
+              f"[{type_name} template]({template_url}). "
+              f"The `needs-template` label has been applied so this is "
+              f"queryable. Remove it once the body is updated."
+          )
+
+          subprocess.run(
+              ["gh", "issue", "comment", issue_num, "--repo", repo,
+               "--body", comment],
+              capture_output=True,
+          )
+
+          print(f"Issue #{issue_num}: labeled needs-template and commented.")
+          PYEOF
