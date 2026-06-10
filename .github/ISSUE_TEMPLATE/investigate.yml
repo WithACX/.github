@@ -1,0 +1,34 @@
+name: Investigate
+description: A question or hypothesis to explore before deciding whether to build
+title: "[INVESTIGATE] "
+labels: ["investigate"]
+type: Task
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this for open questions, spikes, or feasibility checks. The outcome
+        is a decision or recommendation, not necessarily shipped code.
+        Keep the `[INVESTIGATE]` title prefix.
+  - type: textarea
+    id: what
+    attributes:
+      label: What to investigate
+      description: The question, hypothesis, or area to explore.
+      placeholder: "e.g. Does X support Y? Is Z the right approach for..."
+    validations:
+      required: true
+  - type: textarea
+    id: why
+    attributes:
+      label: Why it matters
+      description: The motivation, expected value, or decision it unblocks.
+    validations:
+      required: true
+  - type: textarea
+    id: done
+    attributes:
+      label: Definition of done
+      description: What does "investigated" look like? A written recommendation, a spike branch, a decision recorded as an ADR?
+    validations:
+      required: true
