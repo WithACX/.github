@@ -16,9 +16,15 @@ name: Status-sync
 #      lifecycle. Parked-idea signature (milestone + investigate) is
 #      skipped; those are intentional.
 #
-# Board Status writes (trigger 1) require a PAT with the `project` scope
-# stored as the STATUS_SYNC_PAT Actions secret. If the secret is absent,
-# label transitions still execute and a skip notice is logged.
+#   4. Issue closed -- set board Status to Done. The built-in Projects
+#      "Item closed" automation only fires for items already on the board
+#      at the moment of the close event and can miss issues closed via the
+#      API/CLI (e.g. `gh issue close`). This job sets Status: Done
+#      explicitly so every close path (UI, gh, API) lands on Done.
+#
+# Board Status writes (triggers 1 and 4) require a PAT with the `project`
+# scope stored as the STATUS_SYNC_PAT Actions secret. If the secret is
+# absent, label transitions still execute and a skip notice is logged.
 # See knowledge/token-registry.md -- STATUS_SYNC_PAT for setup steps.
 
 on:
@@ -316,4 +322,156 @@ jobs:
               check=False,
           )
           print(f"Issue #{issue_num}: status:draft removed after priority label added")
+          PYEOF
+
+  # ------------------------------------------------------------------
+  # Job 4: Issue closed -- set board Status to Done (requires STATUS_SYNC_PAT)
+  # ------------------------------------------------------------------
+  issue-closed-board-done:
+    name: Issue closed -- board Status Done
+    if: github.event_name == 'issues' && github.event.action == 'closed'
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Set board Status to Done for closed issue
+        env:
+          STATUS_SYNC_PAT: ${{ secrets.STATUS_SYNC_PAT }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          python3 - <<'PYEOF'
+          import json, os, subprocess, sys
+
+          repo = os.environ["REPO"]
+          issue_num = int(os.environ["ISSUE_NUMBER"])
+          pat = os.environ.get("STATUS_SYNC_PAT", "")
+          owner, name = repo.split("/")
+
+          if not pat:
+              print(
+                  "STATUS_SYNC_PAT secret not configured -- board status update "
+                  "skipped. See knowledge/token-registry.md (STATUS_SYNC_PAT)."
+              )
+              sys.exit(0)
+
+          # Find the closed issue's project items and their current Status.
+          query = f"""
+          query {{
+            repository(owner: "{owner}", name: "{name}") {{
+              issue(number: {issue_num}) {{
+                projectItems(first: 10) {{
+                  nodes {{
+                    id
+                    project {{ id title }}
+                    fieldValueByName(name: "Status") {{
+                      ... on ProjectV2ItemFieldSingleSelectValue {{ name }}
+                    }}
+                  }}
+                }}
+              }}
+            }}
+          }}
+          """
+          r = subprocess.run(
+              ["gh", "api", "graphql",
+               "-H", f"Authorization: token {pat}",
+               "-f", f"query={query}"],
+              capture_output=True, text=True,
+          )
+          if r.returncode != 0:
+              print(f"GraphQL error: {r.stderr}", file=sys.stderr)
+              sys.exit(0)  # never block the close
+
+          items = (
+              json.loads(r.stdout)
+              .get("data", {})
+              .get("repository", {})
+              .get("issue", {})
+              .get("projectItems", {})
+              .get("nodes", [])
+          )
+          if not items:
+              print(
+                  f"Issue #{issue_num} is not on any project board -- nothing to do. "
+                  "(Automation only acts on items already on a board at close time.)"
+              )
+              sys.exit(0)
+
+          for item in items:
+              status_val = item.get("fieldValueByName") or {}
+              if status_val.get("name") == "Done":
+                  print(f"  #{issue_num}: already Done -- skipping.")
+                  continue
+              item_id = item["id"]
+              project_id = item["project"]["id"]
+
+              # Discover Status field and Done option ID for this project.
+              field_q = f"""
+              query {{
+                node(id: "{project_id}") {{
+                  ... on ProjectV2 {{
+                    fields(first: 20) {{
+                      nodes {{
+                        ... on ProjectV2SingleSelectField {{
+                          id name
+                          options {{ id name }}
+                        }}
+                      }}
+                    }}
+                  }}
+                }}
+              }}
+              """
+              fr = subprocess.run(
+                  ["gh", "api", "graphql",
+                   "-H", f"Authorization: token {pat}",
+                   "-f", f"query={field_q}"],
+                  capture_output=True, text=True,
+              )
+              if fr.returncode != 0:
+                  print(f"  Field query failed: {fr.stderr}", file=sys.stderr)
+                  continue
+              fields = (
+                  json.loads(fr.stdout)
+                  .get("data", {})
+                  .get("node", {})
+                  .get("fields", {})
+                  .get("nodes", [])
+              )
+              status_field = next(
+                  (f for f in fields if f.get("name") == "Status"), None
+              )
+              if not status_field:
+                  continue
+              done_opt = next(
+                  (o for o in status_field.get("options", [])
+                   if o["name"] == "Done"),
+                  None,
+              )
+              if not done_opt:
+                  print("  No 'Done' option on Status field -- skipping.")
+                  continue
+
+              mutation = f"""
+              mutation {{
+                updateProjectV2ItemFieldValue(input: {{
+                  projectId: "{project_id}"
+                  itemId: "{item_id}"
+                  fieldId: "{status_field['id']}"
+                  value: {{ singleSelectOptionId: "{done_opt['id']}" }}
+                }}) {{ projectV2Item {{ id }} }}
+              }}
+              """
+              mr = subprocess.run(
+                  ["gh", "api", "graphql",
+                   "-H", f"Authorization: token {pat}",
+                   "-f", f"query={mutation}"],
+                  capture_output=True, text=True,
+              )
+              if mr.returncode == 0:
+                  print(f"  #{issue_num}: board Status -> Done")
+              else:
+                  print(f"  #{issue_num}: board update failed: {mr.stderr}",
+                        file=sys.stderr)
           PYEOF
