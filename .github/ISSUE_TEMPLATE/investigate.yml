@@ -1,21 +1,22 @@
 name: Investigate
-description: A question or hypothesis to explore before deciding whether to build
-title: "[INVESTIGATE] "
+description: A question, idea, or hypothesis to explore before deciding whether to build
 labels: ["investigate"]
 type: Task
 body:
   - type: markdown
     attributes:
       value: |
-        Use this for open questions, spikes, or feasibility checks. The outcome
-        is a decision or recommendation, not necessarily shipped code.
-        Keep the `[INVESTIGATE]` title prefix.
+        Use this for open questions, ideas, spikes, or feasibility checks. The
+        outcome is a decision or recommendation, not necessarily shipped code.
+        Only the first two fields and Definition of done are required; the rest
+        are optional but worth filling in so the next person can start without
+        re-deriving the context.
   - type: textarea
     id: what
     attributes:
       label: What to investigate
-      description: The question, hypothesis, or area to explore.
-      placeholder: "e.g. Does X support Y? Is Z the right approach for..."
+      description: The question, idea, hypothesis, or area to explore.
+      placeholder: "e.g. Does X support Y? Is Z the right approach for ...?"
     validations:
       required: true
   - type: textarea
@@ -25,6 +26,52 @@ body:
       description: The motivation, expected value, or decision it unblocks.
     validations:
       required: true
+  - type: textarea
+    id: current-state
+    attributes:
+      label: Current state
+      description: >-
+        What exists today that this touches -- relevant code, prior work, or
+        decisions. Grounds the investigation so the next person does not start cold.
+    validations:
+      required: false
+  - type: textarea
+    id: options
+    attributes:
+      label: Options or directions
+      description: "The approaches worth weighing, with rough trade-offs. Include 'do nothing' when it is a real option."
+    validations:
+      required: false
+  - type: textarea
+    id: recommendation
+    attributes:
+      label: Recommendation
+      description: >-
+        Your current lean and why -- even if the conclusion is not to build.
+        Records the thinking, not just a verdict.
+    validations:
+      required: false
+  - type: textarea
+    id: open-questions
+    attributes:
+      label: Open questions
+      description: What is still unresolved and would change the answer.
+    validations:
+      required: false
+  - type: textarea
+    id: out-of-scope
+    attributes:
+      label: Out of scope
+      description: What this explicitly does not cover.
+    validations:
+      required: false
+  - type: textarea
+    id: related
+    attributes:
+      label: Related
+      description: Linked issues, decision records, docs, or external sources.
+    validations:
+      required: false
   - type: textarea
     id: done
     attributes:
