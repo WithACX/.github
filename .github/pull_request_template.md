@@ -7,7 +7,7 @@ pull request template overrides this file.
 
 <!-- One or two sentences: what this changes and why. -->
 
-Closes #<!-- issue number; use "Closes" / "Fixes" so the issue auto-closes on merge -->
+Closes #<!-- issue number; use "Closes" / "Fixes" so the issue auto-closes on merge. Closing MORE than one issue? Repeat the keyword per number -- "Closes #1, closes #2, closes #3" -- GitHub auto-closes only the first number otherwise, leaving the rest open. -->
 
 ## Checklist
 
