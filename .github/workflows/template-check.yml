@@ -34,7 +34,7 @@ jobs:
       GH_TOKEN: ${{ github.token }}
     steps:
       - name: Check out the repo (for its issue templates)
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - name: Evaluate conformance and flag if needed
         env:
           ISSUE_NUMBER: ${{ github.event.issue.number }}
