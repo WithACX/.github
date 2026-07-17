@@ -54,7 +54,13 @@ jobs:
       # owner/repo-parameterized helpers are inlined below).
       - uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7.1.0
         with:
-          github-token: ${{ secrets.ORG_PR_REMINDER_TOKEN }}
+          # Fall back to the workflow's own GITHUB_TOKEN when the org secret is
+          # unset. `github-token` is a REQUIRED input: passing an empty secret
+          # makes github-script fail up front ("Input required and not supplied:
+          # github-token") BEFORE the inert-guard below can run. The fallback
+          # lets the step start on a valid (own-repo-only) token so the guard
+          # decides inert-vs-run by the ORG_PR_REMINDER_TOKEN env var instead.
+          github-token: ${{ secrets.ORG_PR_REMINDER_TOKEN || github.token }}
           script: |
             // Inert until the org-scoped token is provisioned. github-script
             // always supplies a client, but without ORG_PR_REMINDER_TOKEN it is
