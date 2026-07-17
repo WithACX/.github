@@ -1,0 +1,40 @@
+name: Task
+description: A task or sub-issue of a feature -- a concrete, independently deliverable unit of work
+title: "[FEAT] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        For a task or sub-issue of a feature. Apply the `feature request` label
+        (there is no separate task label) and use the `## Scope` +
+        `## Acceptance criteria` shape below, never ad-hoc child headings, so the
+        task passes the template check. A task labeled `documentation` uses the
+        documentation template instead.
+  - type: textarea
+    id: scope
+    attributes:
+      label: Scope
+      description: What this task covers -- the concrete unit of work.
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      description: What must be true for this task to be done. Verifiable checks.
+    validations:
+      required: true
+  - type: textarea
+    id: out-of-scope
+    attributes:
+      label: Out of scope
+      description: Anything this task should explicitly not cover.
+    validations:
+      required: false
+  - type: input
+    id: parent
+    attributes:
+      label: Parent feature
+      description: A plain link to the parent feature issue (survives sub-issue detachment).
+    validations:
+      required: false
