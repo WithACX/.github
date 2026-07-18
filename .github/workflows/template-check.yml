@@ -155,6 +155,13 @@ jobs:
               if all(has_heading(body, h) for h in task_headings):
                   print("Task sub-issue shape detected (Scope + Acceptance criteria). Conforms.")
                   sys.exit(0)
+              # A manual-execution task (additive `manual` label) may instead
+              # use the manual shape -- assets/issue-templates/manual.yml.
+              manual_headings = ["What", "Why manual", "Steps"]
+              if "manual" in [l.lower() for l in labels] and all(
+                      has_heading(body, h) for h in manual_headings):
+                  print("Manual-task shape detected (What + Why manual + Steps). Conforms.")
+                  sys.exit(0)
 
           missing = [h for h in required_headings if not has_heading(body, h)]
 
