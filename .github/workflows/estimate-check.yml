@@ -1,0 +1,185 @@
+name: Estimate-check
+
+# Server-side backstop for the readiness contract's Estimate requirement (the
+# github skill's references/triage.md, "Readiness model"): a status:ready
+# issue that is not a buildable bug must carry a non-empty board Estimate.
+# Runs on a weekly schedule plus issue label/edit events, so a violation is
+# caught whether it was missed at grant time or introduced later (e.g. a
+# manual status:ready label add, or an Estimate cleared after the fact).
+#
+# STANDALONE by design: the full check runs inline in this workflow, not as a
+# thin caller into a reusable workflow hosted in the (unpublished) withACX/.github
+# org repo -- a thin caller would fail in every repo until that org repo ships
+# reusable workflows. This file is also mirrored to
+# skills/github/assets/org-defaults/.github/workflows/ for later org-wide
+# rollout via the org-defaults publish path (ADR-0055); until then it only
+# protects this repo.
+#
+# On a violation: ensures the `needs-estimate` label exists (idempotent,
+# --force), applies it, and posts (or refreshes) one marker comment naming the
+# issue. Compliant issues -- Estimate set, or not on any linked board -- are
+# left untouched, never re-labeled or re-commented.
+#
+# Reading the board Estimate value works with the default GITHUB_TOKEN for an
+# issue's own projectItems (the same read shape status-sync.yml's Job 1 already
+# relies on for board Status). If a repo's board setup ever needs more --
+# organization Projects v2 access the default token cannot reach -- set the
+# optional ESTIMATE_CHECK_PAT secret (a fine-grained PAT, resource owner
+# withACX, permission Projects: Read; the existing STATUS_SYNC_PAT satisfies
+# this and may be reused) and the read falls back to it automatically. See
+# knowledge/token-registry.md.
+
+on:
+  schedule:
+    # Tuesdays at 09:00 UTC -- weekly sweep of open status:ready issues.
+    - cron: "0 9 * * 2"
+  issues:
+    types: [labeled, edited]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  check-estimate:
+    name: Flag status:ready issues with an empty Estimate
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Enumerate open status:ready issues and check the board Estimate
+        env:
+          REPO: ${{ github.repository }}
+          ESTIMATE_CHECK_PAT: ${{ secrets.ESTIMATE_CHECK_PAT }}
+          ESTIMATE_CHECK_STATUS_PAT: ${{ secrets.STATUS_SYNC_PAT }}
+        run: |
+          python3 - <<'PYEOF'
+          import json, os, subprocess, sys
+
+          repo = os.environ["REPO"]
+          owner, name = repo.split("/")
+          # Prefer a dedicated PAT if set, else reuse STATUS_SYNC_PAT (same
+          # Projects-read permission), else fall back to the default token.
+          pat = os.environ.get("ESTIMATE_CHECK_PAT") or os.environ.get(
+              "ESTIMATE_CHECK_STATUS_PAT") or ""
+
+          MARKER = "**Estimate check:**"
+          LABEL = "needs-estimate"
+
+          def gh(*args, check=True):
+              cmd = ["gh", *args]
+              r = subprocess.run(cmd, capture_output=True, text=True)
+              if check and r.returncode != 0:
+                  print(f"gh {' '.join(args[:3])}... failed: {r.stderr.strip()}",
+                        file=sys.stderr)
+              return r
+
+          def graphql(query):
+              args = ["api", "graphql", "-f", f"query={query}"]
+              if pat:
+                  args = ["api", "graphql", "-H", f"Authorization: token {pat}",
+                          "-f", f"query={query}"]
+              r = gh(*args, check=False)
+              if r.returncode != 0:
+                  return None
+              try:
+                  return json.loads(r.stdout)
+              except json.JSONDecodeError:
+                  return None
+
+          # Open status:ready issues -- the readiness contract's scope (github
+          # skill references/triage.md, "Readiness model"). A buildable bug
+          # (bug + priority:*, no status:ready needed) is out of scope here by
+          # construction: it never carries status:ready.
+          listed = gh("issue", "list", "--repo", repo, "--state", "open",
+                      "--label", "status:ready", "--limit", "500",
+                      "--json", "number,title", check=False)
+          if listed.returncode != 0:
+              print(f"Could not list status:ready issues: {listed.stderr.strip()}",
+                    file=sys.stderr)
+              sys.exit(0)  # never fail the scheduled run on a transient list error
+          issues = json.loads(listed.stdout or "[]")
+          print(f"{repo}: {len(issues)} open status:ready issue(s) to check.")
+
+          flagged = skipped_no_board = compliant = 0
+
+          for issue in issues:
+              n = issue["number"]
+              title = issue["title"][:60]
+
+              q = (
+                  "query{repository(owner:\"%s\",name:\"%s\"){issue(number:%d){"
+                  "projectItems(first:10){nodes{"
+                  "fieldValueByName(name:\"Estimate\"){"
+                  "... on ProjectV2ItemFieldNumberValue{number}"
+                  "}}}}}}}" % (owner, name, n)
+              )
+              data = graphql(q)
+              nodes = (
+                  ((((data or {}).get("data") or {}).get("repository") or {})
+                   .get("issue") or {}).get("projectItems") or {}
+              ).get("nodes") or []
+
+              if not nodes:
+                  # Not on any linked board -- board-conditional no-op, matches
+                  # every other Estimate/Actual write in the pipeline.
+                  skipped_no_board += 1
+                  continue
+
+              has_estimate = any(
+                  (item.get("fieldValueByName") or {}).get("number") is not None
+                  for item in nodes
+              )
+              if has_estimate:
+                  compliant += 1
+                  continue
+
+              # Violation: ensure the label exists (idempotent), apply it, and
+              # post or refresh the marker comment. Compliant issues above are
+              # never touched.
+              gh("label", "create", LABEL, "--repo", repo, "--color", "E5B700",
+                 "--description",
+                 "status:ready issue granted with a default Estimate -- see "
+                 "the github skill references/triage.md",
+                 "--force", check=False)
+              gh("issue", "edit", str(n), "--repo", repo,
+                 "--add-label", LABEL, check=False)
+
+              comment = (
+                  f"{MARKER} issue #{n} is `status:ready` with an empty board "
+                  "`Estimate`. A non-empty Estimate (Fibonacci story points: "
+                  "1/2/3/5/8/13) is part of the readiness contract. Set it on "
+                  "the project board, or run `/deliver-plan` / `/github enrich` "
+                  "to apply the default-and-flag value. Remove `needs-estimate` "
+                  "once a real Estimate is set."
+              )
+              existing = gh("api", f"repos/{owner}/{name}/issues/{n}/comments",
+                            "--jq", f'[.[] | select(.body | startswith("{MARKER}")) '
+                                    '| {id, body}]',
+                            check=False)
+              comment_id = None
+              if existing.returncode == 0 and existing.stdout.strip():
+                  try:
+                      found = json.loads(existing.stdout)
+                      if found:
+                          comment_id = found[0]["id"]
+                  except (json.JSONDecodeError, KeyError, IndexError):
+                      comment_id = None
+
+              if comment_id:
+                  gh("api", "-X", "PATCH",
+                     f"repos/{owner}/{name}/issues/comments/{comment_id}",
+                     "-f", f"body={comment}", check=False)
+                  print(f"  #{n} {title!r}: needs-estimate applied, comment refreshed.")
+              else:
+                  gh("issue", "comment", str(n), "--repo", repo,
+                     "--body", comment, check=False)
+                  print(f"  #{n} {title!r}: needs-estimate applied, comment posted.")
+              flagged += 1
+
+          print(
+              f"\nDone. {flagged} flagged, {compliant} already compliant, "
+              f"{skipped_no_board} skipped (not on a linked board)."
+          )
+          PYEOF
