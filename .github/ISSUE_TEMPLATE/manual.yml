@@ -1,0 +1,45 @@
+name: Manual task
+description: A manual-execution task -- work Claude Code cannot perform in an automated run
+title: "[FEAT] "
+labels: ["manual"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        For work Claude Code cannot perform in an automated run: web-UI
+        registration/config, secret/credential provisioning, manual or
+        non-Claude-Code AI runs, approvals/procurement/legal, and
+        physical/offline actions. An external-doc task (Confluence/SharePoint/
+        wiki) uses the documentation template instead. Apply the `manual`
+        label (this form's default) alongside whatever type label fits the
+        work -- most often `feature request`. Use the `## What` /
+        `## Why manual` / `## Steps` shape below, never ad-hoc headings, so
+        the task passes the template check.
+  - type: textarea
+    id: what
+    attributes:
+      label: What
+      description: The concrete manual action someone (a human, or a non-Claude-Code AI run) must perform.
+    validations:
+      required: true
+  - type: textarea
+    id: why-manual
+    attributes:
+      label: Why manual
+      description: Which manual-execution category this falls under, and why Claude Code cannot do it in an automated run.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps
+      description: The concrete steps to perform, in order.
+    validations:
+      required: true
+  - type: input
+    id: parent
+    attributes:
+      label: Parent feature
+      description: A plain link to the parent feature issue (survives sub-issue detachment).
+    validations:
+      required: false
