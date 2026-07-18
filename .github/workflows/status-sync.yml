@@ -22,7 +22,7 @@ name: Status-sync
 #      API/CLI (e.g. `gh issue close`). This job sets Status: Done
 #      explicitly so every close path (UI, gh, API) lands on Done -- EXCEPT
 #      it holds a parent at In Review (never Done) while it still has an open
-#      non-external-doc sub-issue (enforced completion gate).
+#      non-manual sub-issue (enforced completion gate).
 #
 # Board Status writes (triggers 1 and 4) require a PAT with the `project`
 # scope stored as the STATUS_SYNC_PAT Actions secret. If the secret is
@@ -401,23 +401,18 @@ jobs:
               sys.exit(0)
 
           # Enforced completion gate. Never set a parent to Done while it has an
-          # open non-external-doc sub-issue; hold it at In Review instead. This
+          # open non-manual sub-issue; hold it at In Review instead. This
           # workflow fires AFTER the close and cannot veto it, so it only corrects
           # the board; reopening a wrongly-closed parent is the reconciler's job
-          # (gh_board_status.py --remediate). External-doc children (Confluence/
-          # SharePoint pages, external wikis) are excluded, matching the delivery
-          # scope rule. Heuristic on title until a formal label exists: match a
-          # platform word AND a doc-surface noun so an engineering task that only
-          # mentions the platform is not wrongly excluded.
-          import re as _re
-          _ext_doc = _re.compile(
-              r"(?i)(?=.*\b(?:confluence|sharepoint|wiki)\b)"
-              r"(?=.*\b(?:page|pages|space|site)\b)"
-          )
+          # (gh_board_status.py --remediate). Manual-execution children -- the
+          # additive `manual` label (github skill references/triage.md,
+          # "Manual-execution task class"); external-doc is its named subtype --
+          # are excluded, matching the delivery scope rule (MSP-01, #630;
+          # supersedes the former title heuristic once carried here for #602).
           sr = subprocess.run(
               ["gh", "api", f"repos/{owner}/{name}/issues/{issue_num}/sub_issues",
                "-H", f"Authorization: token {pat}",
-               "--jq", "[.[] | {number, state, title}]"],
+               "--jq", "[.[] | {number, state, title, labels: [.labels[].name]}]"],
               capture_output=True, text=True,
           )
           open_children = []
@@ -429,8 +424,9 @@ jobs:
           elif sr.stdout.strip() not in ("", "null"):
               try:
                   for c in json.loads(sr.stdout):
+                      child_labels = [str(l).lower() for l in (c.get("labels") or [])]
                       if (c.get("state") or "").lower() == "open" \
-                              and not _ext_doc.search(c.get("title") or ""):
+                              and "manual" not in child_labels:
                           open_children.append(c["number"])
               except json.JSONDecodeError:
                   pass
