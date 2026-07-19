@@ -1,19 +1,10 @@
 name: Estimate-check
 
-# Server-side backstop for the readiness contract's Estimate requirement (the
-# github skill's references/triage.md, "Readiness model"): a status:ready
-# issue that is not a buildable bug must carry a non-empty board Estimate.
-# Runs on a weekly schedule plus issue label/edit events, so a violation is
-# caught whether it was missed at grant time or introduced later (e.g. a
-# manual status:ready label add, or an Estimate cleared after the fact).
-#
-# STANDALONE by design: the full check runs inline in this workflow, not as a
-# thin caller into a reusable workflow hosted in the (unpublished) withACX/.github
-# org repo -- a thin caller would fail in every repo until that org repo ships
-# reusable workflows. This file is also mirrored to
-# skills/github/assets/org-defaults/.github/workflows/ for later org-wide
-# rollout via the org-defaults publish path (ADR-0055); until then it only
-# protects this repo.
+# Server-side backstop: an open status:ready issue that is not a buildable
+# bug must carry a non-empty board Estimate. Runs on a weekly schedule plus
+# issue label/edit events, so a violation is caught whether it was missed at
+# grant time or introduced later (e.g. a manual status:ready label add, or
+# an Estimate cleared after the fact).
 #
 # On a violation: ensures the `needs-estimate` label exists (idempotent,
 # --force), applies it, and posts (or refreshes) one marker comment naming the
@@ -21,13 +12,11 @@ name: Estimate-check
 # left untouched, never re-labeled or re-commented.
 #
 # Reading the board Estimate value works with the default GITHUB_TOKEN for an
-# issue's own projectItems (the same read shape status-sync.yml's Job 1 already
-# relies on for board Status). If a repo's board setup ever needs more --
+# issue's own projectItems. If a repo's board setup ever needs more --
 # organization Projects v2 access the default token cannot reach -- set the
 # optional ESTIMATE_CHECK_PAT secret (a fine-grained PAT, resource owner
-# withACX, permission Projects: Read; the existing STATUS_SYNC_PAT satisfies
-# this and may be reused) and the read falls back to it automatically. See
-# knowledge/token-registry.md.
+# withACX, permission Projects: Read) and the read falls back to it
+# automatically.
 
 on:
   schedule:
@@ -88,10 +77,9 @@ jobs:
               except json.JSONDecodeError:
                   return None
 
-          # Open status:ready issues -- the readiness contract's scope (github
-          # skill references/triage.md, "Readiness model"). A buildable bug
-          # (bug + priority:*, no status:ready needed) is out of scope here by
-          # construction: it never carries status:ready.
+          # Open status:ready issues. A buildable bug (bug + priority:*, no
+          # status:ready needed) is out of scope here by construction: it
+          # never carries status:ready.
           listed = gh("issue", "list", "--repo", repo, "--state", "open",
                       "--label", "status:ready", "--limit", "500",
                       "--json", "number,title", check=False)
@@ -140,8 +128,7 @@ jobs:
               # never touched.
               gh("label", "create", LABEL, "--repo", repo, "--color", "E5B700",
                  "--description",
-                 "status:ready issue granted with a default Estimate -- see "
-                 "the github skill references/triage.md",
+                 "status:ready issue with an empty board Estimate",
                  "--force", check=False)
               gh("issue", "edit", str(n), "--repo", repo,
                  "--add-label", LABEL, check=False)
@@ -149,10 +136,9 @@ jobs:
               comment = (
                   f"{MARKER} issue #{n} is `status:ready` with an empty board "
                   "`Estimate`. A non-empty Estimate (Fibonacci story points: "
-                  "1/2/3/5/8/13) is part of the readiness contract. Set it on "
-                  "the project board, or run `/deliver-plan` / `/github enrich` "
-                  "to apply the default-and-flag value. Remove `needs-estimate` "
-                  "once a real Estimate is set."
+                  "1/2/3/5/8/13) is expected before an issue is marked ready. "
+                  "Set it on the project board. Remove `needs-estimate` once a "
+                  "real Estimate is set."
               )
               existing = gh("api", f"repos/{owner}/{name}/issues/{n}/comments",
                             "--jq", f'[.[] | select(.body | startswith("{MARKER}")) '
