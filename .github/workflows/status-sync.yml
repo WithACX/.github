@@ -21,8 +21,8 @@ name: Status-sync
 #      at the moment of the close event and can miss issues closed via the
 #      API/CLI (e.g. `gh issue close`). This job sets Status: Done
 #      explicitly so every close path (UI, gh, API) lands on Done -- EXCEPT
-#      it holds a parent at In Review (never Done) while it still has an open
-#      non-manual sub-issue (enforced completion gate).
+#      it holds a parent at In Review (never Done) while it still has any open
+#      sub-issue, manual included (enforced completion gate; ADR-0085 D4).
 #
 # Board Status writes (triggers 1 and 4) require a PAT with the `project`
 # scope stored as the STATUS_SYNC_PAT Actions secret. If the secret is
@@ -400,15 +400,17 @@ jobs:
               )
               sys.exit(0)
 
-          # Enforced completion gate. Never set a parent to Done while it has an
-          # open non-manual sub-issue; hold it at In Review instead. This
-          # workflow fires AFTER the close and cannot veto it, so it only corrects
-          # the board; reopening a wrongly-closed parent is the reconciler's job
+          # Enforced completion gate. Never set a parent to Done while it has
+          # ANY open sub-issue, manual included; hold it at In Review instead
+          # (ADR-0085 D4, RRV #857 -- an open sub-issue never blocks the feature
+          # PR merge, but it does block the parent reaching Done). This workflow
+          # fires AFTER the close and cannot veto it, so it only corrects the
+          # board; reopening a wrongly-closed parent is the reconciler's job
           # (gh_board_status.py --remediate). Manual-execution children -- the
           # additive `manual` label (github skill references/triage.md,
           # "Manual-execution task class"); external-doc is its named subtype --
-          # are excluded, matching the delivery scope rule (MSP-01, #630;
-          # supersedes the former title heuristic once carried here for #602).
+          # count toward this hold like any other open child; they are no longer
+          # excluded (that exclusion was the #857 bug).
           sr = subprocess.run(
               ["gh", "api", f"repos/{owner}/{name}/issues/{issue_num}/sub_issues",
                "-H", f"Authorization: token {pat}",
@@ -424,9 +426,7 @@ jobs:
           elif sr.stdout.strip() not in ("", "null"):
               try:
                   for c in json.loads(sr.stdout):
-                      child_labels = [str(l).lower() for l in (c.get("labels") or [])]
-                      if (c.get("state") or "").lower() == "open" \
-                              and "manual" not in child_labels:
+                      if (c.get("state") or "").lower() == "open":
                           open_children.append(c["number"])
               except json.JSONDecodeError:
                   pass
