@@ -11,11 +11,20 @@ name: Estimate-check
 # issue. Compliant issues -- Estimate set, or not on any linked board -- are
 # left untouched, never re-labeled or re-commented.
 #
-# Reading the board Estimate value works with the default GITHUB_TOKEN for an
-# issue's own projectItems. If a repo's board setup ever needs more --
-# organization Projects v2 access the default token cannot reach -- set the
-# optional ESTIMATE_CHECK_PAT secret (a fine-grained PAT, resource owner
-# withACX, permission Projects: Read) and the read falls back to it
+# The Estimate read is topology-aware and fully self-contained (inline GraphQL
+# only -- no external script dependency, since this file ships standalone to
+# repos that do not carry any companion tooling). When the repo has one or
+# more natively-linked boards, one query discovers them, then each board's
+# items + Estimate are paged in ~100-item batches (cursor pagination) --
+# bounded page requests, not one query per issue. When there is no linked
+# board (detached mode, or no board at all), it falls back to a per-issue read
+# (each issue's own projectItems, then its Estimate) so an explicit-add /
+# detached board is still found; that path runs only where there is no linked
+# board to batch. Both paths enumerate organization Projects v2 items, which
+# the default GITHUB_TOKEN often cannot reach -- so set the optional
+# ESTIMATE_CHECK_PAT secret (a fine-grained PAT, resource owner withACX,
+# permission Projects: Read; the existing STATUS_SYNC_PAT satisfies this and
+# may be reused) and the discovery and read queries authenticate with it
 # automatically.
 
 on:
@@ -88,38 +97,134 @@ jobs:
                     file=sys.stderr)
               sys.exit(0)  # never fail the scheduled run on a transient list error
           issues = json.loads(listed.stdout or "[]")
-          print(f"{repo}: {len(issues)} open status:ready issue(s) to check.")
+          ready = {i["number"]: i["title"][:60] for i in issues}
+          print(f"{repo}: {len(ready)} open status:ready issue(s) to check.")
+
+          # Build two sets over the status:ready issues: `on_board` (items on any
+          # board) and `has_estimate` (a non-empty board Estimate). Two paths,
+          # picked by topology:
+          #
+          #   LINKED boards (the common case): discover the repo's
+          #   natively-linked board(s) with ONE `repository.projectsV2` query,
+          #   then page each board's items + Estimate with a cursor-paginated
+          #   query (100 items/request). This collapses a per-issue read (one
+          #   query per status:ready issue) into a bounded page count.
+          #
+          #   NO linked board (detached mode -- the code repo is never natively
+          #   linked and items are placed with an explicit add, or a repo with
+          #   no board at all): `repository.projectsV2` returns nothing, so fall
+          #   back to a per-issue read (per issue: projectItems + its Estimate
+          #   in one query). This finds items on a board the repo is not
+          #   natively linked to. It runs ONLY when there is no linked board to
+          #   batch.
+          #
+          # Board DISCOVERY / per-issue lookups are not per-item board-field
+          # reads; the Estimate values in the linked path always come from the
+          # paginated batch query, never one query per issue.
+
+          # first:100 -- more than any repo's linked-board count in practice;
+          # full pagination is unnecessary at this scale.
+          disc = graphql(
+              "query{repository(owner:\"%s\",name:\"%s\"){"
+              "projectsV2(first:100){nodes{number owner{login}}}}}" % (owner, name)
+          )
+          boards = [
+              (b.get("owner", {}).get("login"), b.get("number"))
+              for b in ((((disc or {}).get("data") or {}).get("repository") or {})
+                        .get("projectsV2") or {}).get("nodes") or []
+              if b.get("owner", {}).get("login") and b.get("number")
+          ]
+
+          on_board = set()      # issue numbers that are items on a board
+          has_estimate = set()  # issue numbers with a non-empty board Estimate
+
+          def list_board_estimates(board_owner, board_number):
+              """Page one board's items + Estimate field value, 100/request,
+              following pageInfo.hasNextPage/endCursor. Returns a list of
+              (issue_number, has_estimate) for items whose content is an Issue
+              or PR living in this repo -- bounded page requests, not one
+              query per issue."""
+              rows = []
+              cursor = None
+              while True:
+                  after_clause = ('after:"%s"' % cursor) if cursor else ""
+                  q = (
+                      "query{organization(login:\"%s\"){projectV2(number:%d){"
+                      "items(first:100,%s){"
+                      "pageInfo{hasNextPage endCursor}"
+                      "nodes{"
+                      "content{"
+                      "... on Issue{number repository{nameWithOwner}}"
+                      "... on PullRequest{number repository{nameWithOwner}}"
+                      "}"
+                      "fieldValueByName(name:\"Estimate\"){"
+                      "... on ProjectV2ItemFieldNumberValue{number}"
+                      "}"
+                      "}}}}}}" % (board_owner, board_number, after_clause)
+                  )
+                  data = graphql(q)
+                  items = ((((data or {}).get("data") or {}).get("organization") or {})
+                           .get("projectV2") or {}).get("items") or {}
+                  for node in items.get("nodes") or []:
+                      content = node.get("content") or {}
+                      num = content.get("number")
+                      if num is None:
+                          continue  # draft item -- no issue/PR number to key on
+                      nwo = (content.get("repository") or {}).get("nameWithOwner")
+                      if nwo and nwo.lower() != repo.lower():
+                          continue  # a shared org board hosting other repos
+                      has_val = (node.get("fieldValueByName") or {}).get(
+                          "number") is not None
+                      rows.append((num, has_val))
+                  page = items.get("pageInfo") or {}
+                  if not page.get("hasNextPage"):
+                      break
+                  cursor = page.get("endCursor")
+                  if not cursor:  # defensive: no cursor but hasNextPage -- stop
+                      break
+              return rows
+
+          if boards:
+              # LINKED path: one paginated batch read per discovered board.
+              for bowner, bnum in boards:
+                  for num, has_val in list_board_estimates(bowner, bnum):
+                      on_board.add(num)
+                      if has_val:
+                          has_estimate.add(num)
+          else:
+              # FALLBACK (no natively-linked board -- detached or none): a
+              # per-issue read so an explicit-add board is still found.
+              for n in ready:
+                  q = (
+                      "query{repository(owner:\"%s\",name:\"%s\"){issue(number:%d){"
+                      "projectItems(first:10){nodes{"
+                      "fieldValueByName(name:\"Estimate\"){"
+                      "... on ProjectV2ItemFieldNumberValue{number}"
+                      "}}}}}}}" % (owner, name, n)
+                  )
+                  data = graphql(q)
+                  nodes = (
+                      ((((data or {}).get("data") or {}).get("repository") or {})
+                       .get("issue") or {}).get("projectItems") or {}
+                  ).get("nodes") or []
+                  if not nodes:
+                      continue  # not on any board
+                  on_board.add(n)
+                  if any(
+                      (item.get("fieldValueByName") or {}).get("number") is not None
+                      for item in nodes
+                  ):
+                      has_estimate.add(n)
 
           flagged = skipped_no_board = compliant = 0
 
-          for issue in issues:
-              n = issue["number"]
-              title = issue["title"][:60]
-
-              q = (
-                  "query{repository(owner:\"%s\",name:\"%s\"){issue(number:%d){"
-                  "projectItems(first:10){nodes{"
-                  "fieldValueByName(name:\"Estimate\"){"
-                  "... on ProjectV2ItemFieldNumberValue{number}"
-                  "}}}}}}}" % (owner, name, n)
-              )
-              data = graphql(q)
-              nodes = (
-                  ((((data or {}).get("data") or {}).get("repository") or {})
-                   .get("issue") or {}).get("projectItems") or {}
-              ).get("nodes") or []
-
-              if not nodes:
+          for n, title in ready.items():
+              if n not in on_board:
                   # Not on any linked board -- board-conditional no-op, matches
                   # every other Estimate/Actual write in the pipeline.
                   skipped_no_board += 1
                   continue
-
-              has_estimate = any(
-                  (item.get("fieldValueByName") or {}).get("number") is not None
-                  for item in nodes
-              )
-              if has_estimate:
+              if n in has_estimate:
                   compliant += 1
                   continue
 
