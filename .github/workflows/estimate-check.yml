@@ -128,7 +128,7 @@ jobs:
               # never touched.
               gh("label", "create", LABEL, "--repo", repo, "--color", "E5B700",
                  "--description",
-                 "status:ready issue with an empty board Estimate",
+                 "status:ready issue held in draft pending a size",
                  "--force", check=False)
               gh("issue", "edit", str(n), "--repo", repo,
                  "--add-label", LABEL, check=False)
@@ -136,8 +136,10 @@ jobs:
               comment = (
                   f"{MARKER} issue #{n} is `status:ready` with an empty board "
                   "`Estimate`. A non-empty Estimate (Fibonacci story points: "
-                  "1/2/3/5/8/13) is expected before an issue is marked ready. "
-                  "Set it on the project board. Remove `needs-estimate` once a "
+                  "1/2/3/5/8/13) is part of the readiness contract: this is a "
+                  "contract violation to fix by sizing the issue on the "
+                  "project board, or by dropping it back to `status:draft` -- "
+                  "never by applying a default. Remove `needs-estimate` once a "
                   "real Estimate is set."
               )
               existing = gh("api", f"repos/{owner}/{name}/issues/{n}/comments",
