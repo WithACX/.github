@@ -513,3 +513,288 @@ jobs:
                   print(f"  #{issue_num}: board update failed: {mr.stderr}",
                         file=sys.stderr)
           PYEOF
+
+  # ------------------------------------------------------------------
+  # Job 5: Child closed -- auto-close the PARENT when the completion gate's
+  #        forward direction passes. Job 4 sets the CLOSING issue's own board
+  #        Status; this job looks the other way -- it resolves the closing
+  #        issue's PARENT and evaluates the five-condition close predicate:
+  #          1. every sub-issue closed (manual included)
+  #          2. no unchecked "- [ ]" in the parent body
+  #          3. no open PR referencing the parent (closing keyword)
+  #          4. no open blocked-by dependency
+  #          5. no `needs-answer` marker label on the parent
+  #        Predicate passes -> close the parent and set board Done. Predicate
+  #        fails -> hold the parent at In Review and maintain ONE sticky comment
+  #        naming every failed condition and notifying the assignee. A failed
+  #        query is indeterminate -> hold, never close on incomplete data. The
+  #        board write needs STATUS_SYNC_PAT; without it the issue close still
+  #        happens and the board write is skipped with a WARN. Never fails the
+  #        originating close event. Self-contained -- no repo scripts required.
+  # ------------------------------------------------------------------
+  parent-auto-close:
+    name: Child closed -- auto-close parent when predicate passes
+    if: github.event_name == 'issues' && github.event.action == 'closed'
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Resolve parent and evaluate the close predicate
+        env:
+          STATUS_SYNC_PAT: ${{ secrets.STATUS_SYNC_PAT }}
+          CLOSING_ISSUE: ${{ github.event.issue.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          python3 - <<'PYEOF'
+          import json, os, re, subprocess, sys
+
+          repo = os.environ["REPO"]
+          closing = int(os.environ["CLOSING_ISSUE"])
+          pat = os.environ.get("STATUS_SYNC_PAT", "")
+          owner, name = repo.split("/")
+          HOLD_MARKER = "<!-- acx:parent-auto-close-hold -->"
+          NEEDS_ANSWER = "needs-answer"
+          UNCHECKED_RE = re.compile(r"^\s*[-*]\s+\[ \]", re.MULTILINE)
+          # A closing keyword followed by one or more comma-separated "#N", so
+          # "Closes #10, #11, #12" is fully detected, not just the first number.
+          CLOSING_LIST = re.compile(
+              r"(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+((?:#\d+(?:\s*,\s*)?)+)",
+              re.IGNORECASE)
+
+          def closing_numbers(text):
+              nums = set()
+              for m in CLOSING_LIST.finditer(text or ""):
+                  nums.update(int(n) for n in re.findall(r"#(\d+)", m.group(1)))
+              return nums
+
+          def gh(args, token=None):
+              env = dict(os.environ)
+              if token:
+                  env["GH_TOKEN"] = token
+              return subprocess.run(["gh"] + args, capture_output=True,
+                                    text=True, env=env)
+
+          def gh_json(args):
+              r = gh(args)
+              if r.returncode != 0:
+                  return None, (r.stderr or "").strip()
+              out = (r.stdout or "").strip()
+              if not out:
+                  return [], None
+              try:
+                  return json.loads(out), None
+              except json.JSONDecodeError as exc:
+                  return None, str(exc)
+
+          # 1. Resolve the closing issue's parent (+ its project items and Status).
+          q = f"""
+          query {{
+            repository(owner: "{owner}", name: "{name}") {{
+              issue(number: {closing}) {{
+                parent {{
+                  number
+                  state
+                  projectItems(first: 10) {{
+                    nodes {{
+                      id
+                      project {{ id title }}
+                      fieldValueByName(name: "Status") {{
+                        ... on ProjectV2ItemFieldSingleSelectValue {{ name }}
+                      }}
+                    }}
+                  }}
+                }}
+              }}
+            }}
+          }}
+          """
+          r = gh(["api", "graphql", "-f", f"query={q}"])
+          if r.returncode != 0:
+              print(f"GraphQL error resolving parent: {r.stderr}", file=sys.stderr)
+              sys.exit(0)  # never block the close
+          try:
+              data = json.loads(r.stdout)
+          except (json.JSONDecodeError, ValueError):
+              print("Could not parse parent lookup response -- skipping.", file=sys.stderr)
+              sys.exit(0)
+          parent = (data.get("data", {}).get("repository", {})
+                    .get("issue", {}) or {}).get("parent")
+          if not parent:
+              print(f"#{closing} has no parent -- nothing to auto-close.")
+              sys.exit(0)
+          pn = parent["number"]
+          if (parent.get("state") or "").lower() == "closed":
+              print(f"Parent #{pn} already closed -- nothing to do.")
+              sys.exit(0)
+
+          # 2. Evaluate the five-condition close predicate on the parent.
+          failures = []
+          indeterminate = False
+          assignees = []
+
+          # --paginate WITHOUT --jq so a parent with >30 sub-issues is fully
+          # seen (per-page --jq would hide open children on later pages).
+          subs, err = gh_json(
+              ["api", "--paginate", f"repos/{repo}/issues/{pn}/sub_issues"])
+          if subs is None:
+              indeterminate = True
+              failures.append(f"could not query sub-issues ({err[:120]})")
+          else:
+              open_children = [c["number"] for c in subs
+                               if (c.get("state") or "").lower() == "open"]
+              if open_children:
+                  failures.append("open sub-issue(s): "
+                                  + ", ".join(f"#{n}" for n in open_children))
+
+          if not indeterminate:
+              pobj, err = gh_json(
+                  ["issue", "view", str(pn), "--repo", repo,
+                   "--json", "body,labels,assignees"])
+              if pobj is None or not isinstance(pobj, dict):
+                  indeterminate = True
+                  failures.append(f"could not read parent #{pn} ({(err or '')[:120]})")
+              else:
+                  assignees = [a["login"] for a in pobj.get("assignees", [])]
+                  unchecked = UNCHECKED_RE.findall(pobj.get("body") or "")
+                  if unchecked:
+                      failures.append(
+                          f"{len(unchecked)} unchecked acceptance-criteria checkbox(es)")
+                  if NEEDS_ANSWER in [l["name"] for l in pobj.get("labels", [])]:
+                      failures.append("`needs-answer` is set (an unresolved question)")
+
+          if not indeterminate:
+              prs, err = gh_json(
+                  ["pr", "list", "--repo", repo, "--state", "open", "--limit", "200",
+                   "--json", "number,body"])
+              if prs is None:
+                  indeterminate = True
+                  failures.append(f"could not list open PRs ({(err or '')[:120]})")
+              else:
+                  refs = sorted({pr["number"] for pr in prs
+                                 if pn in closing_numbers(pr.get("body") or "")})
+                  if refs:
+                      failures.append("open PR(s) referencing this parent: "
+                                      + ", ".join(f"#{n}" for n in refs))
+
+          if not indeterminate:
+              blk, err = gh_json(
+                  ["api", f"repos/{repo}/issues/{pn}/dependencies/blocked_by",
+                   "--jq", "[.[] | {number, state}]"])
+              if blk is None:
+                  indeterminate = True
+                  failures.append(f"could not query blocked-by ({(err or '')[:120]})")
+              else:
+                  ob = [b["number"] for b in blk if (b.get("state") or "").lower() == "open"]
+                  if ob:
+                      failures.append("open blocked-by dependency: "
+                                      + ", ".join(f"#{n}" for n in ob))
+
+          passes = (not indeterminate) and (len(failures) == 0)
+
+          # 3. Sticky comment helpers (ONE comment per parent, updated in place).
+          def find_hold():
+              # --paginate WITHOUT --jq so gh merges all comment pages into one
+              # array; match the marker AND require the Actions bot as author so
+              # a forged comment carrying the public marker cannot be adopted.
+              cr = gh(["api", "--paginate",
+                       f"repos/{owner}/{name}/issues/{pn}/comments"])
+              if cr.returncode != 0 or not cr.stdout.strip():
+                  return None
+              try:
+                  comments = json.loads(cr.stdout)
+              except json.JSONDecodeError:
+                  return None
+              for c in comments:
+                  login = (c.get("user") or {}).get("login", "")
+                  if HOLD_MARKER in (c.get("body") or "") and login == "github-actions[bot]":
+                      return c
+              return None
+
+          def upsert_hold(body):
+              existing = find_hold()
+              full = HOLD_MARKER + "\n" + body
+              if existing:
+                  gh(["api", "--method", "PATCH",
+                      f"repos/{owner}/{name}/issues/comments/{existing['id']}",
+                      "-f", f"body={full}"])
+              else:
+                  gh(["issue", "comment", str(pn), "--repo", repo, "--body", full])
+
+          def set_board(target_name):
+              if not pat:
+                  print(f"  #{pn}: STATUS_SYNC_PAT absent -- board write to "
+                        f"{target_name} skipped (WARN).")
+                  return
+              for item in parent.get("projectItems", {}).get("nodes", []):
+                  if (item.get("fieldValueByName") or {}).get("name") == target_name:
+                      continue
+                  project_id = item["project"]["id"]
+                  fq = f"""
+                  query {{ node(id: "{project_id}") {{ ... on ProjectV2 {{
+                    fields(first: 20) {{ nodes {{ ... on ProjectV2SingleSelectField {{
+                      id name options {{ id name }} }} }} }} }} }} }}
+                  """
+                  fr = gh(["api", "graphql", "-f", f"query={fq}"], token=pat)
+                  if fr.returncode != 0:
+                      print(f"  Field query failed: {fr.stderr}", file=sys.stderr)
+                      continue
+                  fields = (json.loads(fr.stdout).get("data", {}).get("node", {})
+                            .get("fields", {}).get("nodes", []))
+                  sf = next((f for f in fields if f.get("name") == "Status"), None)
+                  if not sf:
+                      continue
+                  opt = next((o for o in sf.get("options", [])
+                              if o["name"] == target_name), None)
+                  if not opt:
+                      print(f"  No '{target_name}' option -- skipping.")
+                      continue
+                  mut = f"""
+                  mutation {{ updateProjectV2ItemFieldValue(input: {{
+                    projectId: "{project_id}" itemId: "{item['id']}"
+                    fieldId: "{sf['id']}"
+                    value: {{ singleSelectOptionId: "{opt['id']}" }}
+                  }}) {{ projectV2Item {{ id }} }} }}
+                  """
+                  mr = gh(["api", "graphql", "-f", f"query={mut}"], token=pat)
+                  if mr.returncode == 0:
+                      print(f"  #{pn}: board Status -> {target_name}")
+                  else:
+                      print(f"  #{pn}: board update failed: {mr.stderr}", file=sys.stderr)
+
+          # 4. Act on the verdict.
+          if indeterminate:
+              upsert_hold(f"**Parent auto-close held** on #{pn}. The close predicate "
+                          "could not be fully evaluated (a query failed); the parent "
+                          "is held rather than closed on incomplete data.\n\nReason(s):\n"
+                          + "\n".join(f"- {f}" for f in failures))
+              print(f"  #{pn}: INDETERMINATE -- held, not closed.")
+              sys.exit(0)
+
+          if not passes:
+              mentions = " ".join(f"@{a}" for a in assignees) if assignees \
+                  else "_(parent is unassigned -- owner action needed)_"
+              upsert_hold(f"**Parent auto-close held** on #{pn}: the completion gate's "
+                          "forward direction is blocked. This parent stays at "
+                          "`In Review` and open until every condition below clears.\n\n"
+                          "Blocking condition(s):\n"
+                          + "\n".join(f"- {f}" for f in failures)
+                          + f"\n\n{mentions}")
+              set_board("In Review")
+              print(f"  #{pn}: HELD -- {len(failures)} blocking condition(s).")
+              sys.exit(0)
+
+          existing = find_hold()
+          if existing:
+              gh(["api", "--method", "PATCH",
+                  f"repos/{owner}/{name}/issues/comments/{existing['id']}",
+                  "-f", f"body={HOLD_MARKER}\n**Hold cleared.** All close-predicate "
+                  "conditions now pass; closing the parent."])
+          cr = gh(["issue", "close", str(pn), "--repo", repo, "--comment",
+                   f"Auto-closed: every sub-issue is closed and the completion-gate "
+                   f"close predicate passes (triggered by #{closing} closing)."])
+          if cr.returncode == 0:
+              print(f"  #{pn}: auto-closed (predicate passed).")
+              set_board("Done")
+          else:
+              print(f"  #{pn}: close failed: {cr.stderr}", file=sys.stderr)
+          PYEOF
