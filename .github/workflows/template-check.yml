@@ -16,7 +16,10 @@ name: Template-conformance check
 # Skips: issues from the Actions runner itself (avoids loops), types with no
 # structured template (wontfix, blank issues), and repos with no templates.
 #
-# Distribute via the org-defaults path (withACX/.github, ADR-0055).
+# Reach: this workflow protects only the repository it is committed to. It runs
+# on that repository's own issue events, so every repository that wants the
+# check needs its own copy. An org `.github` repository distributes community
+# health files and never workflows.
 
 on:
   issues:
