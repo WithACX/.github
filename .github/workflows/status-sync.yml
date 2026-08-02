@@ -518,7 +518,9 @@ jobs:
   #        issue's PARENT and evaluates the five-condition close predicate:
   #          1. every sub-issue closed (manual included)
   #          2. no unchecked "- [ ]" in the parent body
-  #          3. no open PR referencing the parent (closing keyword)
+  #          3. no open PR from a TRUSTED head referencing the parent (closing
+  #             keyword; trusted = same-repo, or cross-repo author with push
+  #             access -- an unqualified lookup lets a fork PR forge a hold)
   #          4. no open blocked-by dependency
   #          5. no `needs-answer` marker label on the parent
   #        Predicate passes -> close the parent and set board Done. Predicate
@@ -557,6 +559,7 @@ jobs:
           import json
           import re
           import subprocess
+          import sys
           from typing import List, Tuple
 
           UNCHECKED_BOX_RE = re.compile(r"^\s*[-*]\s+\[ \]", re.MULTILINE)
@@ -595,6 +598,39 @@ jobs:
                   return json.loads(out), None
               except json.JSONDecodeError as exc:
                   return None, str(exc)
+
+
+          def _same_repo_head(pr: dict, repo: str) -> bool:
+              """True when the PR's head branch lives in ``repo`` itself.
+
+              A same-repo head can only be pushed by someone who already has write
+              access, so it needs no further probe. A head whose repo is absent (a fork
+              deleted after the PR was opened) is treated as cross-repo -- unknown
+              provenance is never read as trusted.
+              """
+              head_repo = (((pr.get("head") or {}).get("repo") or {}).get("full_name")
+                           or "")
+              return head_repo.lower() == repo.lower()
+
+
+          def _has_push_access(repo: str, login: str) -> Tuple[bool, bool]:
+              """``(has_push, indeterminate)`` for ``login`` on ``repo``.
+
+              Uses the collaborator PERMISSION endpoint, which answers for any user
+              (``none`` for a stranger), rather than the bare collaborator check, which
+              also answers 204 for a read-only collaborator and would over-trust them.
+
+              Any failed or unparsable probe is INDETERMINATE, never "no push access":
+              reading an outage as untrusted would silently drop a legitimate hold and
+              close a parent early, the exact direction this predicate must not fail in.
+              """
+              perm, _err = _gh_json(
+                  ["api", "repos/{0}/collaborators/{1}/permission".format(repo, login)],
+              )
+              if not isinstance(perm, dict):
+                  return False, True
+              role = (perm.get("role_name") or perm.get("permission") or "").lower()
+              return role in ("admin", "maintain", "write"), False
 
 
           def evaluate(repo: str, parent: int) -> Tuple[bool, List[str], bool, List[str]]:
@@ -648,20 +684,57 @@ jobs:
               if NEEDS_ANSWER_LABEL in labels:
                   failures.append("`needs-answer` is set (an unresolved question)")
 
-              # C3: no OPEN PR referencing the parent via a closing keyword.
+              # C3: no OPEN PR from a TRUSTED head referencing the parent via a closing
+              # keyword. An unqualified reverse lookup is forgeable: on a public repo
+              # anyone who can open a fork PR could hold any parent open indefinitely by
+              # writing "closes #<parent>" in its body.
+              #
+              # --paginate over the REST pulls list rather than `gh pr list --limit N`:
+              # any limit is a truncation, and a repo with more open PRs than the cap
+              # would silently MISS a referencing PR and close the parent early -- the
+              # opposite failure direction, and the one that loses data. As in C1, no
+              # --jq: with a filter gh applies it per page and concatenates raw text
+              # instead of merging the array.
               prs, err = _gh_json(
-                  ["pr", "list", "--repo", repo, "--state", "open", "--limit", "200",
-                   "--json", "number,body"],
+                  ["api", "--paginate",
+                   "repos/{0}/pulls?state=open&per_page=100".format(repo)],
               )
               if prs is None:
                   return False, ["could not list open PRs ({0})".format((err or "")[:120])], True, assignees
-              referencing = sorted({
-                  pr["number"] for pr in prs
-                  if parent in closing_numbers(pr.get("body") or "")
-              })
-              if referencing:
+              holding: List[int] = []
+              untrusted: List[int] = []
+              probed = {}  # login -> (has_push, probe_failed); one probe per author
+              referencing = [pr for pr in prs
+                             if parent in closing_numbers(pr.get("body") or "")]
+              for pr in sorted(referencing, key=lambda p: p.get("number") or 0):
+                  number = pr.get("number")
+                  if _same_repo_head(pr, repo):
+                      holding.append(number)
+                      continue
+                  login = ((pr.get("user") or {}).get("login") or "")
+                  if not login:
+                      return False, [
+                          "could not identify the author of cross-repo PR #{0}".format(number)
+                      ], True, assignees
+                  if login not in probed:
+                      probed[login] = _has_push_access(repo, login)
+                  has_push, probe_failed = probed[login]
+                  if probe_failed:
+                      return False, [
+                          "could not verify push access for @{0} on cross-repo PR #{1}"
+                          .format(login, number)
+                      ], True, assignees
+                  (holding if has_push else untrusted).append(number)
+              if untrusted:
+                  # Never silently dropped: logged on every run, and named in the hold
+                  # comment below whenever some other condition holds the parent anyway.
+                  print("close_predicate: not counting untrusted-head PR(s) toward the "
+                        "hold on #{0}: {1}".format(
+                            parent, ", ".join("#{0}".format(n) for n in untrusted)),
+                        file=sys.stderr)
+              if holding:
                   failures.append("open PR(s) referencing this parent: "
-                                  + ", ".join("#{0}".format(n) for n in referencing))
+                                  + ", ".join("#{0}".format(n) for n in holding))
 
               # C4: no OPEN blocked-by dependency. The endpoint returns [] cleanly when a
               # repo has no dependencies, so a non-zero result is a real failure -> hold.
@@ -676,6 +749,15 @@ jobs:
               if open_blockers:
                   failures.append("open blocked-by dependency: "
                                   + ", ".join("#{0}".format(n) for n in open_blockers))
+
+              # An untrusted referencing PR never holds the parent on its own, but when
+              # the parent is held anyway the reader deserves to know it was seen and
+              # deliberately discounted -- otherwise the hold comment reads as if no such
+              # PR exists.
+              if untrusted and failures:
+                  failures.append(
+                      "(not counted -- untrusted head) open PR(s) referencing this parent: "
+                      + ", ".join("#{0}".format(n) for n in untrusted))
 
               return (len(failures) == 0), failures, False, assignees
           # --- END acx:inline-predicate
