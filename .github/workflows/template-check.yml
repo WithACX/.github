@@ -90,6 +90,12 @@ jobs:
           # disagree with the templates it lives beside (#466).
           TYPE_LABELS = {"bug", "feature request", "documentation", "investigate"}
           template_map = {}
+          # The manual-execution template carries no canonical TYPE label (its
+          # `manual` label is additive), so it never lands in template_map -- its
+          # required headings are collected separately below and applied to any
+          # issue carrying `manual` (#1233). Derived at runtime like every other
+          # shape here; never a hardcoded list.
+          manual_required = []
           for path in sorted(glob.glob(".github/ISSUE_TEMPLATE/*.yml")):
               if os.path.basename(path) == "config.yml":
                   continue
@@ -104,8 +110,6 @@ jobs:
                       continue
                   tmpl_labels = [str(x).lower() for x in (data.get("labels") or [])]
                   type_label = next((x for x in tmpl_labels if x in TYPE_LABELS), None)
-                  if type_label is None:
-                      continue
                   required = []
                   for field in data.get("body") or []:
                       if not isinstance(field, dict):
@@ -116,6 +120,10 @@ jobs:
                           heading = attributes.get("label") if isinstance(attributes, dict) else None
                           if heading:
                               required.append(str(heading).strip())
+                  if type_label is None:
+                      if "manual" in tmpl_labels and required:
+                          manual_required = required
+                      continue
                   template_map[type_label] = (
                       required,
                       os.path.basename(path),
@@ -149,21 +157,48 @@ jobs:
               pattern = rf"^#{{2,3}}\s+{re.escape(heading)}\s*$"
               return bool(re.search(pattern, text, re.IGNORECASE | re.MULTILINE))
 
-          # Feature-request label is also used for task sub-issues (A-CX has no
-          # task type label). Accept the canonical task body shape as conforming
-          # so Task sub-issues with ## Scope + ## Acceptance criteria are not
-          # false-flagged as missing feature-request headings.
-          if matched_type == "feature request":
+          # A manual-execution task (the additive `manual` label) has exactly ONE
+          # conforming shape, selected by its subtype -- not a choice among the
+          # type, task, and manual shapes (#1233). The readiness model judges the
+          # external-doc subtype (`documentation` type) by ## Where +
+          # ## What needs to change and every other category by manual.yml's
+          # ## What + ## Why manual + ## Steps, so those are the only two shapes
+          # this check accepts for it. Offering the task shape as an alternative
+          # is what let manual tasks be filed, and granted ready, in a shape the
+          # readiness gate then failed closed on.
+          #
+          # MANUAL_FALLBACK is a fallback, never the source of truth while
+          # manual.yml is readable. (It is not the only literal shape in this
+          # script -- task_headings below is one too -- but it is the only one
+          # standing in for a template the check could not read.) It exists because collapsing to "no manual enforcement"
+          # when the template cannot be found would silently enforce the issue's
+          # OTHER type headings instead, which is the very substitution this
+          # change removes. It is also the literal `provider.py` enforces at
+          # create time, so the two layers agree in EVERY repo state, not only
+          # where the template happens to be installed and well-formed.
+          MANUAL_FALLBACK = ["What", "Why manual", "Steps"]
+          is_manual = "manual" in [l.lower() for l in labels]
+          if is_manual and matched_type != "documentation":
+              if manual_required:
+                  required_headings = manual_required
+                  print(f"Manual-execution task: required shape is {manual_required} "
+                        "(manual.yml).")
+              else:
+                  required_headings = MANUAL_FALLBACK
+                  print("WARNING: no manual-execution template with required "
+                        "fields found under .github/ISSUE_TEMPLATE/ -- template "
+                        "drift. Enforcing the canonical manual shape "
+                        f"{MANUAL_FALLBACK} instead of this issue's type "
+                        "headings. Reinstall the manual template.")
+          elif matched_type == "feature request":
+              # Feature-request label is also used for task sub-issues (A-CX has
+              # no task type label). Accept the canonical task body shape as
+              # conforming so Task sub-issues with ## Scope + ## Acceptance
+              # criteria are not false-flagged as missing feature-request
+              # headings.
               task_headings = ["Scope", "Acceptance criteria"]
               if all(has_heading(body, h) for h in task_headings):
                   print("Task sub-issue shape detected (Scope + Acceptance criteria). Conforms.")
-                  sys.exit(0)
-              # A manual-execution task (additive `manual` label) may instead
-              # use the manual shape -- assets/issue-templates/manual.yml.
-              manual_headings = ["What", "Why manual", "Steps"]
-              if "manual" in [l.lower() for l in labels] and all(
-                      has_heading(body, h) for h in manual_headings):
-                  print("Manual-task shape detected (What + Why manual + Steps). Conforms.")
                   sys.exit(0)
 
           missing = [h for h in required_headings if not has_heading(body, h)]
