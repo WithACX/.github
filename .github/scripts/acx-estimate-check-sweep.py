@@ -79,10 +79,24 @@ def gh(*args: str) -> subprocess.CompletedProcess:
     return subprocess.run(["gh", *args], capture_output=True, text=True)
 
 
-def graphql(query: str) -> Optional[dict]:
-    """One GraphQL query. Returns None on any failure, so every caller treats
-    an unreachable board the same way it treats an absent one."""
-    result = gh("api", "graphql", "-f", "query={0}".format(query))
+def graphql(query: str, **variables) -> Optional[dict]:
+    """One GraphQL query with BOUND variables. Returns None on any failure, so
+    every caller treats an unreachable board the same way it treats an absent one.
+
+    Variables are passed as `gh api graphql -f <name>=<value>` rather than
+    interpolated into the query text -- the same pattern
+    `skills/github/scripts/provider.py` uses. Repo names cannot currently contain
+    a quote or backslash, so interpolation would not be exploitable today, but
+    that makes GitHub's naming charset the only thing standing between a repo name
+    and the query, which is not a guarantee worth depending on.
+    """
+    args = ["api", "graphql", "-f", "query={0}".format(query)]
+    for key, value in variables.items():
+        # -F types the value (so an Int! variable arrives as a number); -f keeps
+        # it a string. Same distinction provider.py makes.
+        flag = "-F" if isinstance(value, int) and not isinstance(value, bool) else "-f"
+        args += [flag, "{0}={1}".format(key, value)]
+    result = gh(*args)
     if result.returncode != 0:
         return None
     try:
@@ -119,6 +133,11 @@ def ready_issues(repo: str) -> Optional[Dict[int, str]]:
     try:
         issues = json.loads(listed.stdout or "[]")
     except json.JSONDecodeError:
+        # Say so. Returning None silently would read in the log exactly like
+        # "this repo has no status:ready issues", hiding a real fault.
+        sys.stderr.write(
+            "  {0}: could not parse the issue list as JSON; skipping repo.\n"
+            .format(repo))
         return None
     return {i["number"]: i["title"][:60] for i in issues}
 
@@ -130,8 +149,9 @@ def linked_boards(owner: str, name: str) -> List[Tuple[str, int]]:
     full pagination is unnecessary at this scale.
     """
     data = graphql(
-        'query{repository(owner:"%s",name:"%s"){'
-        'projectsV2(first:100){nodes{number owner{login}}}}}' % (owner, name)
+        'query($o:String!,$n:String!){repository(owner:$o,name:$n){'
+        'projectsV2(first:100){nodes{number owner{login}}}}}',
+        o=owner, n=name,
     )
     nodes = ((((data or {}).get("data") or {}).get("repository") or {})
              .get("projectsV2") or {}).get("nodes") or []
@@ -178,8 +198,9 @@ def estimates_per_issue(
     has_estimate: Set[int] = set()
     for number in numbers:
         data = graphql(
-            'query{repository(owner:"%s",name:"%s"){issue(number:%d){'
-            'projectItems(first:10){nodes{id}}}}}' % (owner, name, number)
+            'query($o:String!,$n:String!,$i:Int!){repository(owner:$o,name:$n){'
+            'issue(number:$i){projectItems(first:10){nodes{id}}}}}',
+            o=owner, n=name, i=number,
         )
         nodes = ((((data or {}).get("data") or {}).get("repository") or {})
                  .get("issue") or {}).get("projectItems") or {}
@@ -196,21 +217,59 @@ def estimates_per_issue(
     return on_board, has_estimate
 
 
+def ensure_label(repo: str) -> None:
+    """Make sure `needs-estimate` exists in `repo`, without ever redefining a
+    label the repo already owns.
+
+    `gh label create --force` creates OR overwrites, which is fine in a single
+    repo A-CX owns outright. Across N repos it is not: a repo that already uses
+    `needs-estimate` for its own purpose, with its own color and description,
+    would have that definition silently replaced by this sweep. So only create
+    when the label is absent, and when it is present leave its definition alone
+    and say so.
+    """
+    listed = gh("label", "list", "--repo", repo, "--json",
+                "name,color,description", "--limit", "500")
+    existing = None
+    if listed.returncode == 0 and listed.stdout.strip():
+        try:
+            for entry in json.loads(listed.stdout):
+                if entry.get("name") == LABEL:
+                    existing = entry
+                    break
+        except json.JSONDecodeError:
+            existing = None
+
+    if existing is None:
+        # --force still guards the race where a concurrent run created it first.
+        gh("label", "create", LABEL, "--repo", repo, "--color", LABEL_COLOR,
+           "--description", LABEL_DESCRIPTION, "--force")
+        return
+
+    if ((existing.get("color") or "").lstrip("#").upper() != LABEL_COLOR.upper()
+            or (existing.get("description") or "") != LABEL_DESCRIPTION):
+        sys.stderr.write(
+            "  {0}: '{1}' already exists with a different definition "
+            "(color={2!r}, description={3!r}); applying the label and leaving "
+            "its definition unchanged.\n".format(
+                repo, LABEL, existing.get("color"),
+                existing.get("description")))
+
+
 def flag_issue(owner: str, name: str, number: int, title: str) -> None:
     """Apply the label and upsert the one marker comment on a violation."""
     repo = "{0}/{1}".format(owner, name)
-    # --force keeps this idempotent: it creates the label or updates it in place,
-    # so a repo that has never seen the label and one that already has it behave
-    # the same.
-    gh("label", "create", LABEL, "--repo", repo, "--color", LABEL_COLOR,
-       "--description", LABEL_DESCRIPTION, "--force")
+    ensure_label(repo)
     gh("issue", "edit", str(number), "--repo", repo, "--add-label", LABEL)
 
     comment = COMMENT_TEMPLATE.format(marker=MARKER, n=number)
+    # `sort_by(.created_at)` so "the marker comment" is deterministic. The API's
+    # array order is not guaranteed, and if two comments ever start with the
+    # marker the sweep must keep updating the SAME one rather than alternating.
     existing = gh("api", "repos/{0}/{1}/issues/{2}/comments".format(
         owner, name, number),
-        "--jq", '[.[] | select(.body | startswith("{0}")) | {{id, body}}]'.format(
-            MARKER))
+        "--jq", '[.[] | select(.body | startswith("{0}"))] '
+                '| sort_by(.created_at) | [.[] | {{id, body}}]'.format(MARKER))
     comment_id = None
     if existing.returncode == 0 and existing.stdout.strip():
         try:
@@ -294,16 +353,21 @@ def main() -> int:
         return 0
 
     print("Sweeping {0} A-CX-managed repo(s): {1}".format(
-        len(targets), ", ".join(t["repo"] for t in targets)))
+        len(targets),
+        ", ".join(str(t.get("repo", "?")) for t in targets)))
 
     totals = [0, 0, 0]
     for target in targets:
-        owner, name = target["owner"], target["repo"]
+        # The destructuring is INSIDE the try on purpose: a target missing its
+        # owner/repo key must cost that one entry, not the whole sweep. Outside
+        # the try it would raise KeyError and abort every remaining repo, which
+        # is the opposite of what this loop promises.
         try:
+            owner, name = target["owner"], target["repo"]
             result = sweep_repo(cli_path, owner, name)
         except Exception as exc:  # one bad repo must not abort the sweep
-            sys.stderr.write("  {0}/{1}: error ({2}); continuing.\n".format(
-                owner, name, exc))
+            sys.stderr.write("  {0!r}: error ({1}); continuing.\n".format(
+                target, exc))
             continue
         totals = [a + b for a, b in zip(totals, result)]
 
