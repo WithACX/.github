@@ -1,0 +1,130 @@
+# acx-estimate-check-org.yml (CIW.4, ADR-0101 D3) -- ORG-CENTRAL estimate check.
+#
+# This is the CENTRAL scheduled sweep. It belongs in withACX/.github at
+#   .github/workflows/acx-estimate-check-org.yml
+# and gives every A-CX-managed withACX repo the readiness-Estimate backstop with
+# NO per-repo install.
+#
+# WHY CENTRAL RATHER THAN PER REPO. The check is event-independent: it re-reads
+# open status:ready issues wholesale on a schedule, and board Estimate values are
+# reachable through the API from anywhere. Nothing about it needs a repo-local
+# event, so it takes the org-central route ADR-0101 D3 assigns it, the same shape
+# acx-pr-reminders-org.yml already proves in production. Hosting it here is not
+# distribution -- GitHub never inherits workflows from an org `.github` repo -- it
+# reaches a repo only by calling the API against it.
+#
+# WHICH REPOS. Never "every repo in the org". Scope comes from the shared opt-in
+# selector (`.github/scripts/acx-select-managed-repos.js`, CIW.3), which reads the
+# tracked list in a-cx-ai-config and intersects it with a live org read, dropping
+# archived, disabled, and forked repos every run. The third-party forks the org
+# holds are excluded by construction: a repo not on the list is never swept.
+#
+# WHY IT CHECKS OUT a-cx-ai-config. The topology-aware Estimate read already
+# exists as `skills/github/scripts/board_cli.py` (with `provider.py` beside it).
+# This sweep runs THAT file rather than carrying a copy of it. A second copy in
+# this repo would be a mirror with no verifier, which is the exact failure mode
+# ADR-0101 retired the org-defaults workflow mirror over -- so the Estimate values
+# always come from the one implementation, never a re-derivation. The checkout is
+# pinned to the default branch of a repo whose `main` requires a reviewed PR,
+# the same trust anchor the selector documents for reading its list.
+#
+# TOKEN DEPENDENCY: the built-in GITHUB_TOKEN only reaches this workflow's own
+# repo (withACX/.github). Cross-repo issue reads, label and comment writes, and
+# the organization Projects read all need an org-scoped token in the secret
+# ORG_ESTIMATE_CHECK_TOKEN, provisioned with repository access limited to the
+# same opt-in list (ADR-0101 D3). See knowledge/token-registry.md in
+# a-cx-ai-config. Until that secret is provisioned the workflow is inert: it logs
+# a notice and exits 0, exactly as acx-pr-reminders-org.yml does without its own
+# token. It does NOT fail the scheduled run.
+name: acx estimate check (org-central)
+
+on:
+  schedule:
+    # Tuesdays at 10:00 UTC. Weekly, matching the per-repo estimate check's
+    # cadence, and an hour after it so the two do not contend for the same
+    # Projects API budget on the one repo both cover.
+    - cron: "0 10 * * 2"
+  workflow_dispatch: {}
+
+# Only what this workflow's OWN token needs: contents:read to check out this repo
+# for the selector helper and the sweep script. Every cross-repo read and write
+# goes through ORG_ESTIMATE_CHECK_TOKEN, never this token.
+permissions:
+  contents: read
+
+# One sweep at a time. Overlapping runs would both see the same not-yet-created
+# marker comment and double-post.
+concurrency:
+  group: acx-estimate-check-org
+  cancel-in-progress: false
+
+jobs:
+  sweep:
+    name: Flag status:ready issues with an empty Estimate across managed repos
+    runs-on: ubuntu-latest
+    steps:
+      # Decide inert-vs-run BEFORE the cross-repo checkout, which cannot succeed
+      # without the token. A missing secret means "not provisioned yet", not
+      # "broken", so every later step is skipped and the run still exits 0.
+      - name: Check for the org-scoped token
+        id: guard
+        env:
+          ORG_ESTIMATE_CHECK_TOKEN: ${{ secrets.ORG_ESTIMATE_CHECK_TOKEN }}
+        run: |
+          if [ -z "${ORG_ESTIMATE_CHECK_TOKEN}" ]; then
+            echo "has_token=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::ORG_ESTIMATE_CHECK_TOKEN not set -- the org-central estimate check is inert. Provision a fine-grained PAT with repository access limited to the A-CX-managed repo list (Issues: Read and write, Metadata: Read, Projects: Read) as the ORG_ESTIMATE_CHECK_TOKEN secret in withACX/.github. See knowledge/token-registry.md in a-cx-ai-config."
+          else
+            echo "has_token=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # This repo, for .github/scripts/ -- the selector helper and the sweep
+      # script. Its own default branch, never an event ref.
+      - name: Checkout withACX/.github (selector helper + sweep script)
+        if: steps.guard.outputs.has_token == 'true'
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+
+      # a-cx-ai-config, for the shared board CLI. Pinned to the default branch of
+      # a repo whose main requires a reviewed PR; the token is scoped to the
+      # managed list, which includes a-cx-ai-config, so this needs no extra reach.
+      - name: Checkout a-cx-ai-config (shared board_cli.py, never a copy)
+        if: steps.guard.outputs.has_token == 'true'
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          repository: withACX/a-cx-ai-config
+          path: _acx-config
+          token: ${{ secrets.ORG_ESTIMATE_CHECK_TOKEN }}
+          persist-credentials: false
+
+      # Scope resolution through the ONE shared selector. Writes the selected
+      # repos as JSON for the sweep step; the selector throws (failing the run)
+      # when the list cannot be read or parses to nothing, so a sweep can never
+      # silently cover nothing.
+      - name: Resolve the A-CX-managed repo list
+        id: select
+        if: steps.guard.outputs.has_token == 'true'
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7.1.0
+        with:
+          github-token: ${{ secrets.ORG_ESTIMATE_CHECK_TOKEN }}
+          script: |
+            const fs = require("fs");
+            const path = require("path");
+            const { selectManagedRepos } =
+              require(`${process.env.GITHUB_WORKSPACE}/.github/scripts/acx-select-managed-repos.js`);
+            const targets = await selectManagedRepos({ github, core });
+            const out = path.join(process.env.RUNNER_TEMP, "acx-estimate-targets.json");
+            fs.writeFileSync(out, JSON.stringify(targets), "utf8");
+            core.info(
+              `estimate-check scope: ${targets.map((t) => t.repo).join(", ") || "(none)"}`
+            );
+            core.setOutput("targets_file", out);
+
+      - name: Sweep each managed repo for status:ready issues with no Estimate
+        if: steps.guard.outputs.has_token == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.ORG_ESTIMATE_CHECK_TOKEN }}
+          ACX_TARGETS_FILE: ${{ steps.select.outputs.targets_file }}
+          ACX_BOARD_CLI: _acx-config/skills/github/scripts/board_cli.py
+        run: python3 .github/scripts/acx-estimate-check-sweep.py
