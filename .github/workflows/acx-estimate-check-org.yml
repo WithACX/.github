@@ -24,9 +24,22 @@
 # This sweep runs THAT file rather than carrying a copy of it. A second copy in
 # this repo would be a mirror with no verifier, which is the exact failure mode
 # ADR-0101 retired the org-defaults workflow mirror over -- so the Estimate values
-# always come from the one implementation, never a re-derivation. The checkout is
-# pinned to the default branch of a repo whose `main` requires a reviewed PR,
-# the same trust anchor the selector documents for reading its list.
+# always come from the one implementation, never a re-derivation.
+#
+# THE CHECKOUT REF IS DELIBERATELY UNPINNED, and that is a real trade rather than
+# an oversight. It takes a-cx-ai-config's default branch, so this workflow executes
+# whatever `board_cli.py` is on `main` at run time, with the sweep's token in the
+# environment. Accepted because:
+#   - `main` on that repo requires a reviewed PR, the same trust anchor the
+#     selector documents for reading its repo list from the same branch;
+#   - anyone able to merge there already controls every A-CX plugin shipped to
+#     every dev repo, so executing board_cli.py here adds little to that reach;
+#   - pinning a SHA reintroduces staleness and a manual bump step, which is the
+#     mirror-rots-silently failure this design exists to avoid.
+# The residual exposure is the window between a bad merge and someone noticing,
+# bounded by the weekly cadence. If that trade stops being acceptable -- a wider
+# contributor set on a-cx-ai-config, or a token with more reach -- pin `ref:` to a
+# tag bumped deliberately and accept the bump burden.
 #
 # TOKEN DEPENDENCY: the built-in GITHUB_TOKEN only reaches this workflow's own
 # repo (withACX/.github). Cross-repo issue reads, label and comment writes, and
