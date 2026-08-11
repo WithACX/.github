@@ -41,11 +41,23 @@
 # contributor set on a-cx-ai-config, or a token with more reach -- pin `ref:` to a
 # tag bumped deliberately and accept the bump burden.
 #
+# THE "TOKEN WITH MORE REACH" TRIGGER ABOVE HAS FIRED, and was weighed rather
+# than ignored: ADR-0107 widened ORG_ESTIMATE_CHECK_TOKEN to all withACX repos.
+# ADR-0107 D3 records why the ref stays unpinned anyway -- merging to
+# a-cx-ai-config main already confers control of every A-CX plugin shipped
+# everywhere, so the added reach is a widening rather than a new class of
+# compromise, and pinning reintroduces the staleness this design exists to
+# avoid. The remaining live trigger is a wider contributor set on a-cx-ai-config.
+#
 # TOKEN DEPENDENCY: the built-in GITHUB_TOKEN only reaches this workflow's own
 # repo (withACX/.github). Cross-repo issue reads, label and comment writes, and
 # the organization Projects read all need an org-scoped token in the secret
-# ORG_ESTIMATE_CHECK_TOKEN, provisioned with repository access limited to the
-# same opt-in list (ADR-0101 D3). See knowledge/token-registry.md in
+# ORG_ESTIMATE_CHECK_TOKEN. That token is provisioned against ALL withACX
+# repositories, not the opt-in list: ADR-0107 superseded ADR-0101 D3's
+# credential-level scoping so that enrolling a repo stays one reviewed diff in
+# acx-managed-repos.yaml instead of a diff plus an invisible admin-only token
+# edit. The fork exclusion therefore rests on the selector alone -- see ADR-0107
+# D2 for what that costs. See knowledge/token-registry.md in
 # a-cx-ai-config. Until that secret is provisioned the workflow is inert: it logs
 # a notice and exits 0, exactly as acx-pr-reminders-org.yml does without its own
 # token. It does NOT fail the scheduled run.
@@ -86,7 +98,7 @@ jobs:
         run: |
           if [ -z "${ORG_ESTIMATE_CHECK_TOKEN}" ]; then
             echo "has_token=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::ORG_ESTIMATE_CHECK_TOKEN not set -- the org-central estimate check is inert. Provision a fine-grained PAT with repository access limited to the A-CX-managed repo list (Issues: Read and write, Metadata: Read, Projects: Read) as the ORG_ESTIMATE_CHECK_TOKEN secret in withACX/.github. See knowledge/token-registry.md in a-cx-ai-config."
+            echo "::notice::ORG_ESTIMATE_CHECK_TOKEN not set -- the org-central estimate check is inert. Provision a fine-grained PAT owned by withACX (Issues: Read and write, Contents: Read, Metadata: Read, Projects: Read) as the ORG_ESTIMATE_CHECK_TOKEN secret in withACX/.github. Contents: Read is required -- this token is passed to actions/checkout for a-cx-ai-config, so a token minted without it fails on its first authenticated run. See knowledge/token-registry.md in a-cx-ai-config."
           else
             echo "has_token=true" >> "$GITHUB_OUTPUT"
           fi
@@ -95,16 +107,17 @@ jobs:
       # script. Its own default branch, never an event ref.
       - name: Checkout withACX/.github (selector helper + sweep script)
         if: steps.guard.outputs.has_token == 'true'
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
       # a-cx-ai-config, for the shared board CLI. Pinned to the default branch of
-      # a repo whose main requires a reviewed PR; the token is scoped to the
-      # managed list, which includes a-cx-ai-config, so this needs no extra reach.
+      # a repo whose main requires a reviewed PR. This checkout is why the token
+      # needs Contents: Read (ADR-0107); it is org-wide rather than limited to
+      # the managed list, so a-cx-ai-config is reachable by construction.
       - name: Checkout a-cx-ai-config (shared board_cli.py, never a copy)
         if: steps.guard.outputs.has_token == 'true'
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: withACX/a-cx-ai-config
           path: _acx-config
