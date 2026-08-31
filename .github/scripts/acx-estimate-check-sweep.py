@@ -4,9 +4,24 @@
 Deployed by the org-workflows mechanism to `.github/scripts/` in withACX/.github
 and run by `acx-estimate-check-org.yml`. For each A-CX-managed repo the shared
 selector picked, this flags every open `status:ready` issue whose board
-`Estimate` is empty: it ensures the `needs-estimate` label exists, applies it,
-and upserts one marker comment. An issue that is on no board is never touched --
-no label, no comment, no edit.
+`Estimate` is empty OR off the Fibonacci scale: it ensures the `needs-estimate`
+label exists, applies it, and upserts one marker comment. An issue that is on no
+board is never touched -- no label, no comment, no edit.
+
+TWO VIOLATION SHAPES, ONE LABEL (#1920). The sweep used to ask a single question,
+is the Estimate non-empty, so an ILLEGAL value read as compliant. It now also
+refuses a value off the scale, and both shapes carry `needs-estimate`: the remedy
+is identical (size the issue to a legal value, or drop it to `status:draft`), the
+self-healing removal clears either one the moment a legal Estimate is read, and a
+second label would split one readiness signal into two. The comment names the
+offending value, because "off-scale" with no number is not actionable.
+
+THE SCALE IS READ, NEVER RESTATED. `github_config.FIBONACCI_POINTS`, imported
+from the same a-cx-ai-config checkout that supplies ACX_BOARD_CLI, parses the
+`scale:` key in knowledge/github-project-template.yaml. So this sweep, the
+per-repo workflow, and provider.set_field's pre-write gate validate against one
+list. An unloadable scale is a deployment fault and exits non-zero, alongside a
+missing targets file and a missing board CLI.
 
 SELF-HEALING, NOT ONE-WAY (#1788). A compliant read now REMOVES a
 `needs-estimate` the issue is still carrying and retires the marker comment,
@@ -133,6 +148,35 @@ class Evidence(NamedTuple):
     board_rows: int = 0      # item rows parsed from any board, ready or not
     probe_ok: int = 0        # per-issue projectItems queries that answered
 
+
+class RepoTotals(NamedTuple):
+    """One repo's outcome counts, and the shape main() sums across repos.
+
+    NAMED rather than a positional tuple (#1920). This started as a 6-tuple and
+    reached nine fields; at that width every reader of `main()` was decoding bare
+    indices, and inserting or reordering a field had nothing -- no static check,
+    no runtime error -- to catch a silent off-by-one in a check that writes labels
+    across every managed repo. `Evidence` above set the precedent in this same
+    file. `add()` sums two of these field-wise so main() never zips positionally.
+
+    `inconclusive` is a 0/1 flag so it sums like the rest. `flagged_off_scale` is
+    a SUBSET of `flagged`, not a separate bucket: it is carried so the org rollup
+    can print the same breakdown the per-repo estimate-check.yml prints.
+    """
+    flagged: int = 0
+    compliant: int = 0
+    skipped_no_board: int = 0
+    unverified: int = 0
+    deferred_exempt: int = 0
+    bug_exempt: int = 0
+    inconclusive: int = 0
+    cleared: int = 0
+    flagged_off_scale: int = 0
+
+    def add(self, other: "RepoTotals") -> "RepoTotals":
+        return RepoTotals(*[a + b for a, b in zip(self, other)])
+
+
 def _knob(name, default, low, high, cast):
     """Read one numeric knob, clamped, never raising.
 
@@ -180,16 +224,21 @@ LABEL_DESCRIPTION = (
     "status:ready issue held in draft pending a size -- see "
     "the github skill references/triage.md"
 )
-# Matches the per-repo workflow's wording exactly, with {n} the issue number.
+# Matches the per-repo workflow's wording exactly, with {n} the issue number,
+# {shape} the violation shape (empty, or off-scale naming the value -- #1920),
+# and {scale} the Fibonacci scale rendered from FIBONACCI_POINTS.
 COMMENT_TEMPLATE = (
-    "{marker} issue #{n} is `status:ready` with an empty board `Estimate`. A "
-    "non-empty Estimate (Fibonacci story points: 1/2/3/5/8/13) is part of the "
+    "{marker} issue #{n} is `status:ready` with {shape}. "
+    "An Estimate on the Fibonacci story-point scale ({scale}) "
+    "is part of the "
     "readiness contract (ADR-0089): this is a contract violation to fix by "
     "sizing the issue on the project board, or by dropping it back to "
     "`status:draft` -- never by applying a default. This label is removed "
     "automatically once a real Estimate is set and this check reads it "
     "(#1788); removing it by hand is not part of the fix."
 )
+SHAPE_EMPTY = "an empty board `Estimate`"
+SHAPE_OFF_SCALE = "an off-scale board `Estimate` of `{value}`"
 # What the marker comment is rewritten to when the flag is removed (#1788).
 # Matches the per-repo workflow's wording exactly. It keeps the MARKER prefix on
 # purpose: the violation upsert finds this same comment again and turns it back
@@ -200,7 +249,56 @@ RESOLVED_TEMPLATE = (
     "that removal; it is rewritten as a fresh violation notice if the issue is "
     "ever flagged again."
 )
-REASON_ESTIMATE_SET = "its board `Estimate` is now set"
+REASON_ESTIMATE_SET = "its board `Estimate` is now set to a legal value"
+
+# The Fibonacci scale, READ from a-cx-ai-config rather than restated (#1920).
+# Populated by load_scale() in main(), from the github_config.py that sits beside
+# the ACX_BOARD_CLI this sweep already depends on; that module parses
+# knowledge/github-project-template.yaml's `scale:` key, so this sweep, the
+# per-repo workflow, and provider.set_field's pre-write gate all validate against
+# one list. It stays a module global rather than being threaded through every
+# call because the scale is a property of the ORG's board contract, identical for
+# every repo in one sweep -- not per-repo state.
+#
+# "Stdlib only" above is unchanged in substance: github_config imports nothing
+# outside the stdlib at module scope, and this sweep already executes that same
+# checkout's board_cli.py as a subprocess.
+FIBONACCI_POINTS: Tuple[int, ...] = ()
+
+
+def load_scale(cli_path: str) -> Tuple[int, ...]:
+    """Import FIBONACCI_POINTS from the checked-out a-cx-ai-config beside cli_path.
+
+    Raises on failure. main() turns that into the same non-zero exit an unusable
+    ACX_BOARD_CLI already produces: an unreadable scale is an unusable INPUT, not
+    a transient per-repo error, and silently disabling the off-scale half of the
+    check would leave a green run that verified only half of what it claims.
+
+    ESTIMATE_CHECK_SCRIPTS_DIR overrides the derived directory for the regression
+    harness, which stands a stub board_cli.py in a temp dir with no repo around
+    it. Same name and the same test-seam-not-an-operator-control convention as
+    the per-repo workflow, so the two read alike side by side.
+    """
+    scripts_dir = (os.environ.get("ESTIMATE_CHECK_SCRIPTS_DIR")
+                   or os.path.dirname(os.path.abspath(cli_path)))
+    if scripts_dir not in sys.path:
+        sys.path.insert(0, scripts_dir)
+    from github_config import FIBONACCI_POINTS as points  # noqa: E402
+    return tuple(points)
+
+
+def on_scale(raw: str) -> bool:
+    """True when a board Estimate string is a legal story point (#1920).
+
+    A value that will not parse as a number is OFF the scale, not unreadable:
+    this is only ever handed a value a board read actually RETURNED, so an
+    unparseable one is a real illegal value on the board. Failed reads never
+    reach here -- they are `unverified` and are never flagged (#1646).
+    """
+    try:
+        return float(raw) in FIBONACCI_POINTS
+    except (TypeError, ValueError):
+        return False
 REASON_EXEMPT = (
     "it is exempt from the Estimate requirement (the github skill's "
     "references/triage.md, \"Readiness model\")"
@@ -451,7 +549,7 @@ def linked_boards(owner: str, name: str) -> Tuple[List[Tuple[str, int]], bool]:
 
 def estimates_via_boards(
     cli_path: str, repo: str, boards: List[Tuple[str, int]]
-) -> Tuple[Set[int], Set[int], List[str], Evidence]:
+) -> Tuple[Set[int], Set[int], List[str], Evidence, Dict[int, str]]:
     """LINKED path: batch each board's items + Estimate through the board CLI.
 
     Third return value: the discovered boards that did NOT answer. While that
@@ -459,9 +557,14 @@ def estimates_via_boards(
     missing board's rows, so the caller holds every flag (#1646).
 
     Fourth: the positive read evidence this path produced (#1445).
+
+    Fifth: issue number -> the non-empty but OFF-SCALE value read for it (#1920).
+    The VALUE, not a bare set, so the comment can name what is actually on the
+    board; "off-scale" with no number tells the reader nothing they can act on.
     """
     on_board: Set[int] = set()
     has_estimate: Set[int] = set()
+    off_scale: Dict[int, str] = {}
     failed_boards: List[str] = []
     list_field_ok = 0
     board_rows = 0
@@ -485,13 +588,16 @@ def estimates_via_boards(
             on_board.add(number)
             if len(parts) > 2 and parts[2].strip():
                 has_estimate.add(number)
+                if not on_scale(parts[2].strip()):
+                    off_scale[number] = parts[2].strip()
     return (on_board, has_estimate, failed_boards,
-            Evidence(list_field_ok=list_field_ok, board_rows=board_rows))
+            Evidence(list_field_ok=list_field_ok, board_rows=board_rows),
+            off_scale)
 
 
 def estimates_per_issue(
     cli_path: str, owner: str, name: str, numbers: List[int]
-) -> Tuple[Set[int], Set[int], Set[int], Evidence]:
+) -> Tuple[Set[int], Set[int], Set[int], Evidence, Dict[int, str]]:
     """FALLBACK path (no natively-linked board): per-issue item-id then value.
 
     Third return value: issues whose membership or Estimate could not be READ.
@@ -501,9 +607,13 @@ def estimates_per_issue(
 
     Fourth: the positive read evidence this path produced (#1445) -- here, the
     per-issue membership probes that answered at all.
+
+    Fifth: issue number -> the non-empty but OFF-SCALE value read for it (#1920),
+    the same shape estimates_via_boards() returns.
     """
     on_board: Set[int] = set()
     has_estimate: Set[int] = set()
+    off_scale: Dict[int, str] = {}
     unverified: Set[int] = set()
     probe_ok = 0
     for number in numbers:
@@ -532,11 +642,14 @@ def estimates_per_issue(
                 continue
             if out.strip():
                 has_estimate.add(number)
+                if not on_scale(out.strip()):
+                    off_scale[number] = out.strip()
                 break
         else:
             if read_failed:
                 unverified.add(number)
-    return on_board, has_estimate, unverified, Evidence(probe_ok=probe_ok)
+    return (on_board, has_estimate, unverified, Evidence(probe_ok=probe_ok),
+            off_scale)
 
 
 def ensure_label(repo: str) -> None:
@@ -660,13 +773,24 @@ def clear_flag(owner: str, name: str, number: int, title: str,
     return True
 
 
-def flag_issue(owner: str, name: str, number: int, title: str) -> None:
-    """Apply the label and upsert the one marker comment on a violation."""
+def flag_issue(owner: str, name: str, number: int, title: str,
+               off_scale_value: Optional[str] = None) -> None:
+    """Apply the label and upsert the one marker comment on a violation.
+
+    `off_scale_value` names the illegal value when this is the OFF-SCALE shape
+    (#1920); None is the original empty-Estimate shape. One label covers both
+    deliberately -- the remedy is the same, and the self-healing removal clears
+    either the moment a legal Estimate is read.
+    """
     repo = "{0}/{1}".format(owner, name)
     ensure_label(repo)
     gh("issue", "edit", str(number), "--repo", repo, "--add-label", LABEL)
 
-    comment = COMMENT_TEMPLATE.format(marker=MARKER, n=number)
+    shape = (SHAPE_OFF_SCALE.format(value=off_scale_value)
+             if off_scale_value is not None else SHAPE_EMPTY)
+    comment = COMMENT_TEMPLATE.format(
+        marker=MARKER, n=number, shape=shape,
+        scale="/".join(str(p) for p in FIBONACCI_POINTS))
     comment_id = marker_comment_id(owner, name, number)
 
     if comment_id:
@@ -707,14 +831,18 @@ def vacuity_cause(boards: List[Tuple[str, int]], disc_ok: bool,
     return "every per-issue projectItems query failed"
 
 
-def sweep_repo(cli_path: str, owner: str,
-               name: str) -> Tuple[int, int, int, int, int, int, int, int]:
+def sweep_repo(cli_path: str, owner: str, name: str) -> RepoTotals:
     """Check one repo.
 
     Returns (flagged, compliant, skipped_no_board, unverified, deferred_exempt,
-    bug_exempt, inconclusive, cleared) -- `inconclusive` a 0/1 flag so `main()`
-    can sum it like the rest, and `cleared` the stale `needs-estimate` labels
-    this repo's run removed (#1788). The two exemptions are counted SEPARATELY
+    bug_exempt, inconclusive, cleared, flagged_off_scale) -- `inconclusive` a 0/1
+    flag so `main()` can sum it like the rest, `cleared` the stale
+    `needs-estimate` labels this repo's run removed (#1788), and
+    `flagged_off_scale` the subset of `flagged` that carried an OFF-SCALE
+    Estimate rather than an empty one (#1920). That last one is a SUBSET, not a
+    separate bucket: it is reported apart so the org rollup can say the same
+    thing the per-repo workflow's summary says, which is what keeps the two
+    checks readable side by side. The two exemptions are counted SEPARATELY
     rather than summed: they
     are different rules with different remedies, and an operator reading the
     rollup needs to know which one held an issue back (#1690).
@@ -729,7 +857,7 @@ def sweep_repo(cli_path: str, owner: str,
         # it must not roll up as a clean one.
         print("{0}: INCONCLUSIVE -- the status:ready issue list could not be "
               "read; nothing was verified in this repo.".format(repo))
-        return (0, 0, 0, 0, 0, 0, 1, 0)
+        return RepoTotals(inconclusive=1)
     ready = listed.ready
     exempt_count = len(listed.deferred)
     bug_exempt_count = len(listed.bug_exempt)
@@ -754,19 +882,21 @@ def sweep_repo(cli_path: str, owner: str,
     if not ready:
         # Nothing to verify is not the same as verifying nothing: an empty ready
         # set is a legitimate clean zero, exactly as it is per-repo.
-        return (0, 0, 0, 0, exempt_count, bug_exempt_count, 0, cleared)
+        return RepoTotals(deferred_exempt=exempt_count,
+                          bug_exempt=bug_exempt_count, cleared=cleared)
 
     boards, disc_ok = linked_boards(owner, name)
     unverified: Set[int] = set()
     failed_boards: List[str] = []
     if boards:
-        on_board, has_estimate, failed_boards, evidence = estimates_via_boards(
-            cli_path, repo, boards)
+        (on_board, has_estimate, failed_boards, evidence,
+         off_scale) = estimates_via_boards(cli_path, repo, boards)
     else:
-        on_board, has_estimate, unverified, evidence = estimates_per_issue(
-            cli_path, owner, name, list(ready))
+        (on_board, has_estimate, unverified, evidence,
+         off_scale) = estimates_per_issue(cli_path, owner, name, list(ready))
 
     flagged = compliant = skipped_no_board = unverified_count = 0
+    flagged_off_scale = 0   # the #1920 subset of `flagged`, reported apart
     for number, title in ready.items():
         if number in unverified:
             # The read FAILED: neither compliant nor violating, so never flagged
@@ -794,7 +924,7 @@ def sweep_repo(cli_path: str, owner: str,
             # other Estimate/Actual write in the pipeline follows.
             skipped_no_board += 1
             continue
-        if number in has_estimate:
+        if number in has_estimate and number not in off_scale:
             compliant += 1
             # SELF-HEALING, the compliant direction (#1788). The Estimate was
             # READ and is non-empty, so a `needs-estimate` still on the issue is
@@ -804,8 +934,11 @@ def sweep_repo(cli_path: str, owner: str,
                     owner, name, number, title, REASON_ESTIMATE_SET):
                 cleared += 1
             continue
-        flag_issue(owner, name, number, title)
+        # Violation -- EMPTY or OFF-SCALE (#1920).
+        flag_issue(owner, name, number, title, off_scale.get(number))
         flagged += 1
+        if number in off_scale:
+            flagged_off_scale += 1
 
     # A 100% unchecked run over a non-empty ready set, with no evidence that any
     # board was actually READ, means this repo verified nothing (#1445). Keep
@@ -834,9 +967,12 @@ def sweep_repo(cli_path: str, owner: str,
               "({3} off-board, {4} unreadable). This is not a pass.".format(
                   repo, len(ready), unread, skipped_no_board, unverified_count))
 
-    return (flagged, compliant, skipped_no_board, unverified_count,
-            exempt_count, bug_exempt_count, 1 if verified_nothing else 0,
-            cleared)
+    return RepoTotals(
+        flagged=flagged, compliant=compliant,
+        skipped_no_board=skipped_no_board, unverified=unverified_count,
+        deferred_exempt=exempt_count, bug_exempt=bug_exempt_count,
+        inconclusive=1 if verified_nothing else 0, cleared=cleared,
+        flagged_off_scale=flagged_off_scale)
 
 
 def main() -> int:
@@ -859,6 +995,24 @@ def main() -> int:
                 cli_path))
         return 1
 
+    # The Estimate scale, from the same checkout (#1920). A third deployment
+    # fault of the same class as the two above: without it the off-scale half of
+    # this check cannot run, and a run that silently skipped half its contract
+    # while printing a clean summary is exactly the vacuous-pass shape this file
+    # already refuses elsewhere.
+    global FIBONACCI_POINTS
+    try:
+        FIBONACCI_POINTS = load_scale(cli_path)
+    except Exception as exc:
+        sys.stderr.write(
+            "ERROR: could not load the Estimate scale from the a-cx-ai-config "
+            "checkout beside {0!r}: {1}. It must provide "
+            "skills/github/scripts/github_config.py and "
+            "knowledge/github-project-template.yaml.\n".format(cli_path, exc))
+        return 1
+    print("Estimate scale: {0}".format(
+        "/".join(str(p) for p in FIBONACCI_POINTS)))
+
     with open(targets_file, "r", encoding="utf-8") as handle:
         targets = json.load(handle)
     if not targets:
@@ -871,7 +1025,7 @@ def main() -> int:
         len(targets),
         ", ".join(str(t.get("repo", "?")) for t in targets)))
 
-    totals = [0, 0, 0, 0, 0, 0, 0, 0]
+    totals = RepoTotals()
     for target in targets:
         # The destructuring is INSIDE the try on purpose: a target missing its
         # owner/repo key must cost that one entry, not the whole sweep. Outside
@@ -893,11 +1047,11 @@ def main() -> int:
             print("{0!r}: INCONCLUSIVE -- this target could not be swept at "
                   "all ({1}); that is a targets-file or selector fault, not a "
                   "board read.".format(target, exc))
-            totals[6] += 1
+            totals = totals.add(RepoTotals(inconclusive=1))
             continue
-        totals = [a + b for a, b in zip(totals, result)]
+        totals = totals.add(result)
 
-    inconclusive = totals[6]
+    inconclusive = totals.inconclusive
     verified = len(targets) - inconclusive
     if inconclusive:
         # Deliberately does NOT name a cause itself. Repos reach this count two
@@ -919,8 +1073,17 @@ def main() -> int:
         return 1
 
     summary = ("\nDone. {0} flagged, {1} already compliant, {2} skipped "
-               "(not on a linked board).".format(*totals))
-    if totals[3]:
+               "(not on a linked board).".format(
+                   totals.flagged, totals.compliant, totals.skipped_no_board))
+    if totals.flagged_off_scale:
+        # Same clause, same wording, same position as the per-repo
+        # estimate-check.yml prints (#1920). The sweep's own docstring binds
+        # the two checks to identical behavior, and a rollup that dropped this
+        # breakdown would leave org-wide off-scale volume visible on one
+        # surface and invisible on the other.
+        summary += (" {0} of the flagged carried an OFF-SCALE Estimate "
+                    "rather than an empty one (#1920).".format(totals.flagged_off_scale))
+    if totals.unverified:
         # These issues were skipped ON PURPOSE and must not read as compliant
         # (#1646). One unindented line -- GitHub renders a workflow command no
         # other way.
@@ -929,21 +1092,21 @@ def main() -> int:
               "Estimate could not be read after {1} attempt(s). They are neither "
               "verified compliant nor flagged. A read failure is most often "
               "secondary rate limiting; the next scheduled sweep resolves "
-              "it.".format(totals[3], ATTEMPTS))
-        summary += " {0} unverified (board read failed).".format(totals[3])
-    if totals[4]:
+              "it.".format(totals.unverified, ATTEMPTS))
+        summary += " {0} unverified (board read failed).".format(totals.unverified)
+    if totals.deferred_exempt:
         # Same shape the per-repo estimate-check.yml prints, so the two summaries
         # stay readable side by side.
-        summary += " {0} exempt ({1}, ADR-0119).".format(totals[4], DEFERRED_LABEL)
-    if totals[5]:
+        summary += " {0} exempt ({1}, ADR-0119).".format(totals.deferred_exempt, DEFERRED_LABEL)
+    if totals.bug_exempt:
         # Counted apart from the deferred exemption above: same "left alone on
         # purpose" outcome, different rule (#1690).
-        summary += " {0} exempt (buildable bug, #1690).".format(totals[5])
-    if totals[7]:
+        summary += " {0} exempt (buildable bug, #1690).".format(totals.bug_exempt)
+    if totals.cleared:
         # Same conditional-clause shape as the two exemptions above, so an
         # ordinary run's summary stays byte-for-byte what it was (#1788).
         summary += " {0} cleared (stale needs-estimate removed, #1788).".format(
-            totals[7])
+            totals.cleared)
     if inconclusive:
         # Only when there is something to report, so an ordinary run's summary
         # stays byte-for-byte what it was -- the same rule the exempt clause
