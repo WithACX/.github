@@ -217,6 +217,16 @@ def _sleep_before_retry(attempt: int) -> None:
 
 MARKER = "**Estimate check:**"
 LABEL = "needs-estimate"
+# The login a GitHub Actions installation token posts as. The fallback identity
+# for the marker-comment author predicate (#1841) -- see posting_login().
+BOT_LOGIN = "github-actions[bot]"
+# How marker_comment_lookup() classifies what it found. Four states, not a
+# nullable id: "no marker comment" and "a marker comment somebody else wrote"
+# demand opposite actions, and collapsing them is the #1841 defect.
+MARKER_OWN = "own"            # this check wrote it -- safe to rewrite in place
+MARKER_FOREIGN = "foreign"    # somebody else wrote it -- never touched
+MARKER_NONE = "none"          # the issue carries no marker comment at all
+MARKER_UNREADABLE = "unreadable"  # the comments read FAILED -- not a data fact
 # Exempt from this sweep entirely -- see ready_issues() for the rule and ADR-0119.
 DEFERRED_LABEL = "priority:3-deferred"
 LABEL_COLOR = "E5B700"
@@ -691,14 +701,84 @@ def ensure_label(repo: str) -> None:
                 existing.get("description")))
 
 
-def marker_comment_id(owner: str, name: str,
-                      number: int) -> Optional[int]:
-    """The id of THIS sweep's own marker comment on the issue, or None.
+_POSTING_LOGIN = []  # type: List[str]
 
-    Shared by the flag and the un-flag paths so both address the SAME comment:
-    one upserts it into the violation wording, the other rewrites that same body
-    into the resolved wording. Two lookups would be two chances to drift into
-    posting a second marker.
+
+def posting_login() -> str:
+    """The login this sweep's own comments are authored by (#1841).
+
+    Resolved from the AMBIENT token -- the same `GH_TOKEN` `gh issue comment`
+    posts with -- so the answer describes the identity that will actually appear
+    on the comment, not whichever token happened to read the board.
+
+    Two token shapes reach this code and they answer differently, which is why
+    neither a hardcoded login nor a bare live lookup is enough on its own:
+
+      - a USER PAT (`ORG_ESTIMATE_CHECK_TOKEN`, this sweep's normal case)
+        answers `gh api user` with that user's login;
+      - a GitHub Actions INSTALLATION token (what the per-repo twin runs on)
+        cannot call `/user` at all -- the call fails outright -- and posts as
+        `github-actions[bot]`.
+
+    So the FAILURE of the call is itself the signal, and BOT_LOGIN is the only
+    login an installation token can be posting as. Resolved once and memoized:
+    the answer cannot change inside a run, and a sweep spans many repos.
+
+    A wrong answer here is not a security hole -- it can only make this check
+    read its OWN comment as foreign, which the callers handle by doing nothing.
+    It is never able to make somebody else's comment read as ours.
+
+    TWO KNOWN DEGRADATIONS, both failing toward silence rather than damage, and
+    both stated here so a later reader does not "fix" one into something worse:
+
+      - A TRANSIENT failure that outlasts the retries lands this sweep on
+        BOT_LOGIN, which is the wrong answer for a PAT. Every comment the sweep
+        previously posted then reads as foreign for that run, so the #1788
+        self-healing goes quiet until the next run. That is why the call is
+        retried on the same budget as every other read here rather than
+        attempted once: this file's whole read discipline exists because
+        secondary rate limiting under concurrent runs is the observed fault.
+      - ROTATING `ORG_ESTIMATE_CHECK_TOKEN` to a different user makes every
+        marker comment posted under the old login permanently foreign to the new
+        one. The sweep stops retiring those specific comments and says so on
+        stderr; a human clears them. Deliberately not detected here -- guessing
+        at "a login that used to be us" is exactly the author-agnostic match
+        this function exists to remove.
+    """
+    if _POSTING_LOGIN:
+        return _POSTING_LOGIN[0]
+    login = ""
+    for attempt in range(1, ATTEMPTS + 1):
+        probe = gh("api", "user", "--jq", ".login")
+        if probe.returncode == 0 and probe.stdout.strip():
+            login = probe.stdout.strip()
+            break
+        if attempt < ATTEMPTS:
+            _sleep_before_retry(attempt)
+    if not login:
+        # Never silent: an unlogged fallback is indistinguishable from a live
+        # resolution that happened to return the bot, and the two have very
+        # different consequences for a PAT-authenticated sweep.
+        sys.stderr.write(
+            "  `gh api user` did not answer after {0} attempt(s); assuming this "
+            "check posts as {1!r}. Correct under a GitHub Actions installation "
+            "token, which cannot call /user at all. If this sweep is running on "
+            "a user PAT, its own marker comments will read as foreign this run "
+            "and will be left alone rather than refreshed.\n".format(
+                ATTEMPTS, BOT_LOGIN))
+        login = BOT_LOGIN
+    _POSTING_LOGIN.append(login)
+    return login
+
+
+def marker_comments(owner: str, name: str,
+                    number: int) -> Optional[List[Dict[str, object]]]:
+    """Every marker-prefixed comment on the issue, oldest first, with its author.
+
+    Returns a list of `{"id": ..., "login": ...}` entries, or None when the READ
+    FAILED. Those are different facts and the callers act on them differently:
+    an empty list means the issue genuinely carries no marker comment, while None
+    means this run does not know, and a run that does not know must not post.
 
     `sort_by(.created_at)` so "the marker comment" is deterministic. The API's
     array order is not guaranteed, and if two comments ever start with the
@@ -707,14 +787,60 @@ def marker_comment_id(owner: str, name: str,
     existing = gh("api", "repos/{0}/{1}/issues/{2}/comments".format(
         owner, name, number),
         "--jq", '[.[] | select(.body | startswith("{0}"))] '
-                '| sort_by(.created_at) | [.[] | {{id, body}}]'.format(MARKER))
-    if existing.returncode != 0 or not existing.stdout.strip():
+                '| sort_by(.created_at) '
+                '| [.[] | {{id, login: .user.login}}]'.format(MARKER))
+    if existing.returncode != 0:
         return None
+    if not existing.stdout.strip():
+        return []
     try:
         found = json.loads(existing.stdout)
-        return found[0]["id"]
-    except (json.JSONDecodeError, KeyError, IndexError, TypeError):
+    except (json.JSONDecodeError, TypeError):
         return None
+    if not isinstance(found, list):
+        return None
+    return [entry for entry in found if isinstance(entry, dict)]
+
+
+def marker_comment_lookup(owner: str, name: str,
+                          number: int) -> Tuple[str, Optional[int]]:
+    """Classify the issue's marker comments against this sweep's own identity.
+
+    Returns `(state, comment_id)` where state is one of MARKER_OWN (with the id
+    of the comment to rewrite), MARKER_FOREIGN, MARKER_NONE, MARKER_UNREADABLE.
+
+    THE AUTHOR PREDICATE IS THE POINT (#1841). This lookup used to select purely
+    on the body prefix, and MARKER is a fixed string visible in this file. Anyone
+    who could comment on an issue -- a broader permission than label-write on
+    most repos -- could post a comment starting with it and have the next sweep
+    PATCH it, overwriting their text with this check's body while GitHub kept
+    THEIR name on it. A PATCH does not change authorship, so the result read as
+    an official notice attributed to whoever was overwritten: a confused-deputy
+    write to content this sweep does not own.
+
+    IT FAILS TOWARD MATCHING, NEVER TOWARD POSTING. The obvious hazard in adding
+    a predicate is getting it wrong in the quiet direction: a filter that matches
+    nothing makes flag_issue() believe there is no marker comment and POST a new
+    one, on every run, forever. So FOREIGN and UNREADABLE are reported as their
+    own states rather than folded into "nothing found", and neither call site
+    posts on them. If the identity resolution is ever wrong, this sweep's own
+    prior comment reads as FOREIGN and the sweep goes quiet -- which is a visible
+    log line and a stale comment, not an unbounded comment thread.
+
+    Shared by the flag and the un-flag paths so both address the SAME comment:
+    one upserts it into the violation wording, the other rewrites that same body
+    into the resolved wording. Two lookups would be two chances to drift.
+    """
+    found = marker_comments(owner, name, number)
+    if found is None:
+        return (MARKER_UNREADABLE, None)
+    mine = posting_login()
+    for entry in found:
+        if entry.get("login") == mine and entry.get("id"):
+            return (MARKER_OWN, entry["id"])
+    if found:
+        return (MARKER_FOREIGN, None)
+    return (MARKER_NONE, None)
 
 
 def clear_flag(owner: str, name: str, number: int, title: str,
@@ -759,14 +885,25 @@ def clear_flag(owner: str, name: str, number: int, title: str,
             "stands and the marker comment is left as it was. The next sweep "
             "retries.\n".format(number, title, edit.stderr.strip()))
         return False
-    comment_id = marker_comment_id(owner, name, number)
-    if comment_id:
+    state, comment_id = marker_comment_lookup(owner, name, number)
+    if state == MARKER_OWN:
         gh("api", "-X", "PATCH",
            "repos/{0}/{1}/issues/comments/{2}".format(owner, name, comment_id),
            "-f", "body={0}".format(RESOLVED_TEMPLATE.format(
                marker=MARKER, n=number, reason=reason)))
         print("  #{0} {1!r}: needs-estimate removed ({2}); marker comment "
               "retired.".format(number, title, reason))
+    elif state == MARKER_FOREIGN:
+        sys.stderr.write(
+            "  #{0} {1!r}: needs-estimate removed ({2}); a comment starting "
+            "with the marker is present but was NOT written by this check "
+            "({3}), so nothing was retired and it is left exactly as it is "
+            "(#1841).\n".format(number, title, reason, posting_login()))
+    elif state == MARKER_UNREADABLE:
+        sys.stderr.write(
+            "  #{0} {1!r}: needs-estimate removed ({2}); the comments read "
+            "FAILED, so no marker comment was retired. The next sweep "
+            "retries.\n".format(number, title, reason))
     else:
         print("  #{0} {1!r}: needs-estimate removed ({2}); no marker comment "
               "to retire.".format(number, title, reason))
@@ -791,18 +928,34 @@ def flag_issue(owner: str, name: str, number: int, title: str,
     comment = COMMENT_TEMPLATE.format(
         marker=MARKER, n=number, shape=shape,
         scale="/".join(str(p) for p in FIBONACCI_POINTS))
-    comment_id = marker_comment_id(owner, name, number)
+    state, comment_id = marker_comment_lookup(owner, name, number)
 
-    if comment_id:
+    if state == MARKER_OWN:
         gh("api", "-X", "PATCH",
            "repos/{0}/{1}/issues/comments/{2}".format(owner, name, comment_id),
            "-f", "body={0}".format(comment))
         print("  #{0} {1!r}: needs-estimate applied, comment refreshed.".format(
             number, title))
-    else:
+    elif state == MARKER_NONE:
         gh("issue", "comment", str(number), "--repo", repo, "--body", comment)
         print("  #{0} {1!r}: needs-estimate applied, comment posted.".format(
             number, title))
+    elif state == MARKER_FOREIGN:
+        # Neither rewrite nor post. Rewriting is the #1841 confused-deputy write;
+        # posting a second one would repeat on every run, because the foreign
+        # comment never becomes ours. The LABEL still landed, so the readiness
+        # signal is intact -- only the explanatory comment is suppressed.
+        sys.stderr.write(
+            "  #{0} {1!r}: needs-estimate applied, but a comment starting with "
+            "the marker is already present and was NOT written by this check "
+            "({2}). It is left untouched and no second comment was posted "
+            "(#1841); remove that comment to let this check speak again.\n"
+            .format(number, title, posting_login()))
+    else:
+        sys.stderr.write(
+            "  #{0} {1!r}: needs-estimate applied, but the comments read "
+            "FAILED, so no comment was written this run. The next sweep "
+            "retries.\n".format(number, title))
 
 
 def vacuity_cause(boards: List[Tuple[str, int]], disc_ok: bool,
