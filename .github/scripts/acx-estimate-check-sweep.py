@@ -38,6 +38,17 @@ own labels. An unverified read, an unread board, and an off-board issue hold the
 label exactly as they hold the flag (#1646): the fail-closed rule is symmetric,
 and "we could not read it" is not evidence in either direction.
 
+EVERY MUTATION IS VERIFIED BEFORE THE LOG CLAIMS IT (#1828). The label add, the
+comment post, the comment PATCH, and the label create each check their own
+return code at the call site; a failure prints what failed instead of asserting
+`needs-estimate applied`, and a violation whose label did not land is counted in
+`flag_failed` rather than in `flagged`. Deliberately NOT a global `check=True`
+exception policy: a transient comment-post failure must not abort the sweep,
+which would contradict the warn-and-continue contract every other error path
+here keeps. Per-call-site verification with an honest log line and count is the
+shape. This is the mutation-side instance of the class #1247, #1445 and #1646
+fixed on the reporting and read sides.
+
 BEHAVIOR IS DELIBERATELY IDENTICAL to the per-repo `estimate-check.yml` in
 a-cx-ai-config: same label, same colour and description, same marker string, and
 the same comment wording. The two are the same check at different reach, so a
@@ -162,6 +173,12 @@ class RepoTotals(NamedTuple):
     `inconclusive` is a 0/1 flag so it sums like the rest. `flagged_off_scale` is
     a SUBSET of `flagged`, not a separate bucket: it is carried so the org rollup
     can print the same breakdown the per-repo estimate-check.yml prints.
+
+    `flag_failed` is the opposite of a subset: it is DISJOINT from `flagged` and
+    counts violations whose `needs-estimate` label could not be applied (#1828).
+    It is the mutation-side twin of `unverified`, which #1646 added on the read
+    side for the same reason -- an attempt that failed must not be reported as an
+    outcome that happened.
     """
     flagged: int = 0
     compliant: int = 0
@@ -172,6 +189,7 @@ class RepoTotals(NamedTuple):
     inconclusive: int = 0
     cleared: int = 0
     flagged_off_scale: int = 0
+    flag_failed: int = 0
 
     def add(self, other: "RepoTotals") -> "RepoTotals":
         return RepoTotals(*[a + b for a, b in zip(self, other)])
@@ -329,9 +347,45 @@ def buildable_bug(labels: Set[str]) -> bool:
             and "investigate" not in labels)
 
 
-def gh(*args: str) -> subprocess.CompletedProcess:
-    """Run a gh command, capturing output. Never raises on a non-zero exit."""
-    return subprocess.run(["gh", *args], capture_output=True, text=True)
+def gh(*args: str, check: bool = False) -> subprocess.CompletedProcess:
+    """Run a gh command, capturing output. Never raises on a non-zero exit.
+
+    `check=True` ECHOES a non-zero exit to stderr and still returns the
+    completed process, so the caller decides what a failure means. It never
+    raises and never aborts the sweep: this file's contract is warn-and-continue,
+    and a transient comment-post failure must not cost the remaining repos
+    (#1828). Deliberately NOT a global default -- the read paths above are
+    already retried and already report their own exhaustion, so echoing there
+    would double-report every retried blip. Opting in per call site is what makes
+    the MUTATION paths below verifiable without changing the reads.
+
+    Before #1828 this helper had no `check` parameter at all, so no call site
+    could ask for a failure to be reported and every mutation's return code was
+    discarded -- the log then asserted `needs-estimate applied` for a label that
+    may never have landed.
+
+    THE ECHO IS AUDITED, ON THE SAME TERMS AS board_cli()'s BELOW, and this
+    reasoning is stated here rather than by reference because the boundary
+    condition is what a future reader has to know. Two halves:
+
+      - The ARGV half. `args[:3]` is the gh subcommand (`issue edit`,
+        `label create`, `api -X`), and no call site in this file puts a
+        credential in argv: `GH_TOKEN` reaches gh through the process
+        ENVIRONMENT, and the one token this sweep passes explicitly
+        (ORG_ESTIMATE_CHECK_TOKEN, via BOARD_CLI_ENV) also travels by env.
+      - The STDERR half. `result.stderr` is gh's own text, which on an ordinary
+        API failure is GitHub's error JSON -- a 401/403/404/422 or a rate-limit
+        message -- and carries no credential material. THAT HOLDS ONLY WHILE
+        GH_DEBUG AND --verbose STAY UNSET on these calls, because either makes
+        gh trace request headers (Authorization included) to stderr. Nothing in
+        this file sets either today; adding one means revisiting this echo and
+        the identical one in the per-repo twin.
+    """
+    result = subprocess.run(["gh", *args], capture_output=True, text=True)
+    if check and result.returncode != 0:
+        sys.stderr.write("  gh {0}... failed: {1}\n".format(
+            " ".join(args[:3]), result.stderr.strip()))
+    return result
 
 
 def graphql(query: str, label: str = "graphql", **variables) -> Optional[dict]:
@@ -662,9 +716,14 @@ def estimates_per_issue(
             off_scale)
 
 
-def ensure_label(repo: str) -> None:
+def ensure_label(repo: str) -> bool:
     """Make sure `needs-estimate` exists in `repo`, without ever redefining a
     label the repo already owns.
+
+    Returns True when the label is known to exist -- it was already there, or
+    this call created it. False means the create FAILED and is reported as such
+    (#1828); the caller does not stop on it, because the label add that follows
+    is the mutation whose result actually decides whether the issue is flagged.
 
     `gh label create --force` creates OR overwrites, which is fine in a single
     repo A-CX owns outright. Across N repos it is not: a repo that already uses
@@ -687,9 +746,16 @@ def ensure_label(repo: str) -> None:
 
     if existing is None:
         # --force still guards the race where a concurrent run created it first.
-        gh("label", "create", LABEL, "--repo", repo, "--color", LABEL_COLOR,
-           "--description", LABEL_DESCRIPTION, "--force")
-        return
+        created = gh("label", "create", LABEL, "--repo", repo, "--color",
+                     LABEL_COLOR, "--description", LABEL_DESCRIPTION, "--force",
+                     check=True)
+        if created.returncode != 0:
+            sys.stderr.write(
+                "  {0}: could not create '{1}' ({2}); the label add below is "
+                "what decides whether this issue is flagged.\n".format(
+                    repo, LABEL, created.stderr.strip()))
+            return False
+        return True
 
     if ((existing.get("color") or "").lstrip("#").upper() != LABEL_COLOR.upper()
             or (existing.get("description") or "") != LABEL_DESCRIPTION):
@@ -699,6 +765,7 @@ def ensure_label(repo: str) -> None:
             "its definition unchanged.\n".format(
                 repo, LABEL, existing.get("color"),
                 existing.get("description")))
+    return True
 
 
 _POSTING_LOGIN = []  # type: List[str]
@@ -911,17 +978,52 @@ def clear_flag(owner: str, name: str, number: int, title: str,
 
 
 def flag_issue(owner: str, name: str, number: int, title: str,
-               off_scale_value: Optional[str] = None) -> None:
+               off_scale_value: Optional[str] = None) -> bool:
     """Apply the label and upsert the one marker comment on a violation.
 
     `off_scale_value` names the illegal value when this is the OFF-SCALE shape
     (#1920); None is the original empty-Estimate shape. One label covers both
     deliberately -- the remedy is the same, and the self-healing removal clears
     either the moment a legal Estimate is read.
+
+    Returns True when the LABEL ADD succeeded, so the run's `flagged` count
+    reports flags that were applied rather than flags that were attempted
+    (#1828). The label is what the count and the log line both claim, and it is
+    the readiness signal the rest of the pipeline reads; the marker comment is
+    explanatory. So the comment's own outcome is verified and reported on its own
+    line, and it does NOT change this return value -- which is the same split the
+    MARKER_FOREIGN branch below has always made, where the label lands and no
+    comment is written.
+
+    Every mutation here passes `check=True` at its own call site rather than the
+    file switching to a global one: a failed comment post must not abort the
+    sweep, which would contradict the warn-and-continue contract this file's
+    every other error path keeps.
     """
     repo = "{0}/{1}".format(owner, name)
-    ensure_label(repo)
-    gh("issue", "edit", str(number), "--repo", repo, "--add-label", LABEL)
+    # The create's own result is CONSUMED, not merely reported: an add that fails
+    # against a label that does not exist is a different fault from one that
+    # fails against a label that does, and an operator reading the log should not
+    # have to correlate two lines to tell them apart.
+    label_ready = ensure_label(repo)
+    added = gh("issue", "edit", str(number), "--repo", repo,
+               "--add-label", LABEL, check=True)
+    if added.returncode != 0:
+        cause = ("" if label_ready else
+                 " The label could not be created either, so it does not exist "
+                 "on this repo.")
+        # The mirror of clear_flag()'s rule, in the other direction: the comment
+        # tells the reader the issue has been flagged, so writing it over a label
+        # that did not land would leave a false record of this sweep's own
+        # action. Nothing is written, nothing is counted, and the next sweep --
+        # which recomputes the violation from the board -- retries the whole
+        # thing.
+        sys.stderr.write(
+            "  #{0} {1!r}: needs-estimate NOT applied -- the label add FAILED "
+            "({2}).{3} No comment was written, and this issue is counted as a "
+            "failed flag rather than a flagged one. The next sweep "
+            "retries.\n".format(number, title, added.stderr.strip(), cause))
+        return False
 
     shape = (SHAPE_OFF_SCALE.format(value=off_scale_value)
              if off_scale_value is not None else SHAPE_EMPTY)
@@ -931,15 +1033,30 @@ def flag_issue(owner: str, name: str, number: int, title: str,
     state, comment_id = marker_comment_lookup(owner, name, number)
 
     if state == MARKER_OWN:
-        gh("api", "-X", "PATCH",
-           "repos/{0}/{1}/issues/comments/{2}".format(owner, name, comment_id),
-           "-f", "body={0}".format(comment))
-        print("  #{0} {1!r}: needs-estimate applied, comment refreshed.".format(
-            number, title))
+        patched = gh("api", "-X", "PATCH",
+                     "repos/{0}/{1}/issues/comments/{2}".format(
+                         owner, name, comment_id),
+                     "-f", "body={0}".format(comment), check=True)
+        if patched.returncode != 0:
+            sys.stderr.write(
+                "  #{0} {1!r}: needs-estimate applied, but the comment refresh "
+                "FAILED ({2}); the existing marker comment is left as it was. "
+                "The next sweep retries.\n".format(
+                    number, title, patched.stderr.strip()))
+        else:
+            print("  #{0} {1!r}: needs-estimate applied, comment "
+                  "refreshed.".format(number, title))
     elif state == MARKER_NONE:
-        gh("issue", "comment", str(number), "--repo", repo, "--body", comment)
-        print("  #{0} {1!r}: needs-estimate applied, comment posted.".format(
-            number, title))
+        posted = gh("issue", "comment", str(number), "--repo", repo,
+                    "--body", comment, check=True)
+        if posted.returncode != 0:
+            sys.stderr.write(
+                "  #{0} {1!r}: needs-estimate applied, but the comment post "
+                "FAILED ({2}); no comment was written this run. The next sweep "
+                "retries.\n".format(number, title, posted.stderr.strip()))
+        else:
+            print("  #{0} {1!r}: needs-estimate applied, comment posted.".format(
+                number, title))
     elif state == MARKER_FOREIGN:
         # Neither rewrite nor post. Rewriting is the #1841 confused-deputy write;
         # posting a second one would repeat on every run, because the foreign
@@ -956,6 +1073,7 @@ def flag_issue(owner: str, name: str, number: int, title: str,
             "  #{0} {1!r}: needs-estimate applied, but the comments read "
             "FAILED, so no comment was written this run. The next sweep "
             "retries.\n".format(number, title))
+    return True
 
 
 def vacuity_cause(boards: List[Tuple[str, int]], disc_ok: bool,
@@ -988,7 +1106,9 @@ def sweep_repo(cli_path: str, owner: str, name: str) -> RepoTotals:
     """Check one repo.
 
     Returns (flagged, compliant, skipped_no_board, unverified, deferred_exempt,
-    bug_exempt, inconclusive, cleared, flagged_off_scale) -- `inconclusive` a 0/1
+    bug_exempt, inconclusive, cleared, flagged_off_scale, flag_failed) --
+    `flag_failed` the violations whose label add FAILED, disjoint from `flagged`
+    (#1828), `inconclusive` a 0/1
     flag so `main()` can sum it like the rest, `cleared` the stale
     `needs-estimate` labels this repo's run removed (#1788), and
     `flagged_off_scale` the subset of `flagged` that carried an OFF-SCALE
@@ -1050,6 +1170,7 @@ def sweep_repo(cli_path: str, owner: str, name: str) -> RepoTotals:
 
     flagged = compliant = skipped_no_board = unverified_count = 0
     flagged_off_scale = 0   # the #1920 subset of `flagged`, reported apart
+    flag_failed = 0         # the #1828 bucket, DISJOINT from `flagged`
     for number, title in ready.items():
         if number in unverified:
             # The read FAILED: neither compliant nor violating, so never flagged
@@ -1087,11 +1208,15 @@ def sweep_repo(cli_path: str, owner: str, name: str) -> RepoTotals:
                     owner, name, number, title, REASON_ESTIMATE_SET):
                 cleared += 1
             continue
-        # Violation -- EMPTY or OFF-SCALE (#1920).
-        flag_issue(owner, name, number, title, off_scale.get(number))
-        flagged += 1
-        if number in off_scale:
-            flagged_off_scale += 1
+        # Violation -- EMPTY or OFF-SCALE (#1920). Counted only when the label
+        # actually landed (#1828): `flag_issue` returns False when the add
+        # failed, and it has already said what failed on stderr.
+        if flag_issue(owner, name, number, title, off_scale.get(number)):
+            flagged += 1
+            if number in off_scale:
+                flagged_off_scale += 1
+        else:
+            flag_failed += 1
 
     # A 100% unchecked run over a non-empty ready set, with no evidence that any
     # board was actually READ, means this repo verified nothing (#1445). Keep
@@ -1125,7 +1250,7 @@ def sweep_repo(cli_path: str, owner: str, name: str) -> RepoTotals:
         skipped_no_board=skipped_no_board, unverified=unverified_count,
         deferred_exempt=exempt_count, bug_exempt=bug_exempt_count,
         inconclusive=1 if verified_nothing else 0, cleared=cleared,
-        flagged_off_scale=flagged_off_scale)
+        flagged_off_scale=flagged_off_scale, flag_failed=flag_failed)
 
 
 def main() -> int:
@@ -1247,6 +1372,19 @@ def main() -> int:
               "secondary rate limiting; the next scheduled sweep resolves "
               "it.".format(totals.unverified, ATTEMPTS))
         summary += " {0} unverified (board read failed).".format(totals.unverified)
+    if totals.flag_failed:
+        # The mutation-side twin of the read-side warning above (#1828). These
+        # issues ARE violations -- their Estimate was read -- but the label did
+        # not land, so they are not flagged and must not be counted as such.
+        # One unindented line -- GitHub renders a workflow command no other way.
+        print("::warning title=Estimate check could not apply every "
+              "needs-estimate label::{0} issue(s) were identified as violations "
+              "but their `needs-estimate` label could not be applied. They are "
+              "NOT counted as flagged. A failed mutation is most often a "
+              "permissions gap on that repo or secondary rate limiting; the "
+              "next scheduled sweep retries it.".format(totals.flag_failed))
+        summary += " {0} flag attempt(s) FAILED (label not applied).".format(
+            totals.flag_failed)
     if totals.deferred_exempt:
         # Same shape the per-repo estimate-check.yml prints, so the two summaries
         # stay readable side by side.
