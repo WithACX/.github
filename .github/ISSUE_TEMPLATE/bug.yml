@@ -24,6 +24,17 @@ body:
       label: What you expected
     validations:
       required: true
+  - type: textarea
+    id: the-fix
+    attributes:
+      label: The fix
+      description: >-
+        The change that restores intended behavior -- a file and what it should
+        do instead. An open question here ("to be decided", "which approach") is
+        refused: a finding whose fix cannot be named is not yet a bug.
+      placeholder: e.g. the null path in x.py should be guarded before the call.
+    validations:
+      required: true
   - type: input
     id: environment
     attributes:
