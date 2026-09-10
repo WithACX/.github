@@ -507,12 +507,12 @@ def ready_issues(repo: str) -> Optional[ReadyScope]:
     A BUILDABLE BUG is EXEMPT -- `bug` + any `priority:*`, no `investigate` --
     and the exemption is TESTED here rather than assumed (#1534, #1690). This
     function previously asserted that a buildable bug "is ready by the bug
-    exemption and never carries status:ready" and filtered on nothing. The
-    AUT-05 autonomous grant (ADR-0100) sets `status:ready` on exactly such
-    bugs, so the assumption made the sweep flag the issues it was written to
-    leave alone. The contract keys the exemption on the LANE, not on which gate
-    granted readiness (the github skill's references/triage.md, "Readiness
-    model" -- cited, never restated), so a granted bug is exempt too.
+    exemption and never carries status:ready" and filtered on nothing. Any
+    granting path may set `status:ready` on exactly such a bug, so the
+    assumption made the sweep flag the issues it was written to leave alone.
+    The contract keys the exemption on the LANE, not on which gate granted
+    readiness (the github skill's references/triage.md, "Readiness model" --
+    cited, never restated), so such a bug is exempt too.
 
     `priority:3-deferred` is EXEMPT (ADR-0119 D5), on the same rule and for the
     same reason as the per-repo `estimate-check.yml`: a deferred issue is never
