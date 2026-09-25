@@ -336,15 +336,15 @@ REASON_EXEMPT = (
 def buildable_bug(labels: Set[str]) -> bool:
     """The readiness model's buildable bug -- exempt from the Estimate (#1690).
 
-    `bug` + any `priority:*` + no `investigate`. Kept as a named predicate so the
-    sweep and the per-repo `estimate-check.yml` state the same three conditions,
-    and so a test can assert the exemption directly. The rule itself belongs to
-    the github skill's references/triage.md, "Readiness model"; it is applied
-    here, never restated.
+    `bug` + any `priority:*` + no `investigate` + no explicit `status:draft`.
+    A copy, because this sweep runs where the github skill is not installed:
+    `tests/tooling/test_bug_lane_copies_parity.py` pins it, and the per-repo
+    `estimate-check.yml` copy, to `provider.classify_bug_lane`.
     """
     return ("bug" in labels
             and any(lab.startswith("priority:") for lab in labels)
-            and "investigate" not in labels)
+            and "investigate" not in labels
+            and "status:draft" not in labels)
 
 
 def gh(*args: str, check: bool = False) -> subprocess.CompletedProcess:
