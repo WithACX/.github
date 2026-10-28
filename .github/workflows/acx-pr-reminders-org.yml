@@ -12,12 +12,14 @@
 # withACX repos and their open PRs and applies BOTH reminder behaviors to each.
 #
 # TOKEN DEPENDENCY: the built-in GITHUB_TOKEN only reaches this workflow's own
-# repo (withACX/.github). Cross-repo read + comment needs an org-scoped token in
-# the secret ORG_PR_REMINDER_TOKEN -- a fine-grained PAT (or GitHub App
-# installation token) with Contents: Read and Pull requests: Read and write
-# across withACX repos. See knowledge/token-registry.md (ORG_PR_REMINDER_TOKEN)
-# in a-cx-ai-config. Until that secret is provisioned the workflow is inert: it
-# logs a notice and exits 0 (it does NOT fail the scheduled run).
+# repo (withACX/.github). Cross-repo read + comment needs an org-scoped token,
+# ORG_PR_REMINDER_TOKEN -- a fine-grained PAT (or GitHub App installation token)
+# with Contents: Read and Pull requests: Read and write across withACX repos --
+# which the job reads from the AI Config vault as `shared-org-pr-reminder-token`
+# through the shared fetch step (the ai-config-keys skill's
+# references/workflow-fetch.md). A run that cannot read the key fails at the
+# fetch step, naming the repository and the key. See knowledge/token-registry.md
+# (ORG_PR_REMINDER_TOKEN) in a-cx-ai-config.
 #
 # Delivery still depends on each person's GitHub notification settings and a
 # verified A-CX profile email -- the reminder is a comment that @-mentions the
@@ -36,7 +38,7 @@ on:
 # No permissions for THIS workflow's own GITHUB_TOKEN: it is never used. There is
 # no checkout and no default-token API call -- ALL access goes through
 # ORG_PR_REMINDER_TOKEN (passed explicitly to github-script). Strictly least
-# privilege.
+# privilege; the job adds only id-token:write for the vault sign-in.
 permissions: {}
 
 # One sweep at a time: overlapping scheduled runs would double-post while both
@@ -48,35 +50,43 @@ concurrency:
 jobs:
   remind:
     runs-on: ubuntu-latest
+    environment: aiconfig-keys
+    permissions:
+      id-token: write
     steps:
+      - name: Sign in to Azure
+        uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3.1.0
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      - name: Fetch keys from the AI Config vault
+        id: keys
+        shell: bash
+        run: |
+          set -euo pipefail
+          fetch() {  # $1: output name, $2: key name
+            local value
+            if ! value="$(az keyvault secret show --vault-name aiconfig-prod-kv-keys-01 \
+                --name "$2" --query value --output tsv 2>/dev/null)" || [ -z "$value" ]; then
+              echo "::error::$GITHUB_REPOSITORY cannot read $2 from aiconfig-prod-kv-keys-01. Next step (AI Config Admin): grant this repository's workflow access to $2, or create it."
+              exit 1
+            fi
+            case "$value" in *$'\n'*)  # the mask covers only the first line
+              echo "::error::$2 in aiconfig-prod-kv-keys-01 holds more than one line. Next step (AI Config Admin): store it as one line."
+              exit 1;;
+            esac
+            echo "::add-mask::$value"
+            echo "$1=$value" >> "$GITHUB_OUTPUT"
+          }
+          fetch org_pr_reminder_token shared-org-pr-reminder-token
       # No checkout: the script is inline (the shared upsert helper is
       # context.repo-bound and cannot be reused cross-repo, so equivalent
       # owner/repo-parameterized helpers are inlined below).
       - uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         with:
-          # Fall back to the workflow's own GITHUB_TOKEN when the org secret is
-          # unset. `github-token` is a REQUIRED input: passing an empty secret
-          # makes github-script fail up front ("Input required and not supplied:
-          # github-token") BEFORE the inert-guard below can run. The fallback
-          # lets the step start on a valid (own-repo-only) token so the guard
-          # decides inert-vs-run by the ORG_PR_REMINDER_TOKEN env var instead.
-          github-token: ${{ secrets.ORG_PR_REMINDER_TOKEN || github.token }}
+          github-token: ${{ steps.keys.outputs.org_pr_reminder_token }}
           script: |
-            // Inert until the org-scoped token is provisioned. github-script
-            // always supplies a client, but without ORG_PR_REMINDER_TOKEN it is
-            // built from the workflow's own GITHUB_TOKEN, which cannot reach
-            // other withACX repos. Detect the empty secret and exit cleanly.
-            const token = process.env.ORG_PR_REMINDER_TOKEN || "";
-            if (!token) {
-              core.info(
-                "ORG_PR_REMINDER_TOKEN not set -- org-wide PR reminders are inert. " +
-                "Provision a fine-grained PAT (Contents: Read, Pull requests: Read " +
-                "and write across withACX repos) as the ORG_PR_REMINDER_TOKEN secret " +
-                "in withACX/.github. See knowledge/token-registry.md in a-cx-ai-config."
-              );
-              return;  // exit 0 -- do NOT fail the scheduled run
-            }
-
             const ORG = "withACX";
             const READY_MARKER = "<!-- acx:pr-ready -->";
             const REVIEWER_MARKER = "<!-- acx:needs-reviewer -->";
@@ -226,5 +236,3 @@ jobs:
                 }
               }
             }
-        env:
-          ORG_PR_REMINDER_TOKEN: ${{ secrets.ORG_PR_REMINDER_TOKEN }}
