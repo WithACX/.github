@@ -51,16 +51,17 @@
 #
 # TOKEN DEPENDENCY: the built-in GITHUB_TOKEN only reaches this workflow's own
 # repo (withACX/.github). Cross-repo issue reads, label and comment writes, and
-# the organization Projects read all need an org-scoped token in the secret
-# ORG_ESTIMATE_CHECK_TOKEN. That token is provisioned against ALL withACX
+# the organization Projects read all need an org-scoped token,
+# ORG_ESTIMATE_CHECK_TOKEN, which the sweep reads from the AI Config vault as
+# `shared-org-estimate-check-token` through the shared fetch step (the
+# ai-config-keys skill's references/workflow-fetch.md). That token is provisioned against ALL withACX
 # repositories, not the opt-in list: ADR-0107 superseded ADR-0101 D3's
 # credential-level scoping so that enrolling a repo stays one reviewed diff in
 # acx-managed-repos.yaml instead of a diff plus an invisible admin-only token
 # edit. The fork exclusion therefore rests on the selector alone -- see ADR-0107
 # D2 for what that costs. See knowledge/token-registry.md in
-# a-cx-ai-config. Until that secret is provisioned the workflow is inert: it logs
-# a notice and exits 0, exactly as acx-pr-reminders-org.yml does without its own
-# token. It does NOT fail the scheduled run.
+# a-cx-ai-config. A run that cannot read the key fails at the fetch step, naming
+# the repository and the key.
 name: acx estimate check (org-central)
 
 on:
@@ -73,7 +74,8 @@ on:
 
 # Only what this workflow's OWN token needs: contents:read to check out this repo
 # for the selector helper and the sweep script. Every cross-repo read and write
-# goes through ORG_ESTIMATE_CHECK_TOKEN, never this token.
+# goes through ORG_ESTIMATE_CHECK_TOKEN, never this token. The job adds
+# id-token:write for the vault sign-in.
 permissions:
   contents: read
 
@@ -87,26 +89,41 @@ jobs:
   sweep:
     name: Flag status:ready issues with an empty Estimate across managed repos
     runs-on: ubuntu-latest
+    environment: aiconfig-keys
+    permissions:
+      contents: read
+      id-token: write
     steps:
-      # Decide inert-vs-run BEFORE the cross-repo checkout, which cannot succeed
-      # without the token. A missing secret means "not provisioned yet", not
-      # "broken", so every later step is skipped and the run still exits 0.
-      - name: Check for the org-scoped token
-        id: guard
-        env:
-          ORG_ESTIMATE_CHECK_TOKEN: ${{ secrets.ORG_ESTIMATE_CHECK_TOKEN }}
+      - name: Sign in to Azure
+        uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3.1.0
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      - name: Fetch keys from the AI Config vault
+        id: keys
+        shell: bash
         run: |
-          if [ -z "${ORG_ESTIMATE_CHECK_TOKEN}" ]; then
-            echo "has_token=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::ORG_ESTIMATE_CHECK_TOKEN not set -- the org-central estimate check is inert. Provision a fine-grained PAT owned by withACX (Issues: Read and write, Contents: Read, Metadata: Read, Projects: Read) as the ORG_ESTIMATE_CHECK_TOKEN secret in withACX/.github. Contents: Read is required -- this token is passed to actions/checkout for a-cx-ai-config, so a token minted without it fails on its first authenticated run. See knowledge/token-registry.md in a-cx-ai-config."
-          else
-            echo "has_token=true" >> "$GITHUB_OUTPUT"
-          fi
+          set -euo pipefail
+          fetch() {  # $1: output name, $2: key name
+            local value
+            if ! value="$(az keyvault secret show --vault-name aiconfig-prod-kv-keys-01 \
+                --name "$2" --query value --output tsv 2>/dev/null)" || [ -z "$value" ]; then
+              echo "::error::$GITHUB_REPOSITORY cannot read $2 from aiconfig-prod-kv-keys-01. Next step (AI Config Admin): grant this repository's workflow access to $2, or create it."
+              exit 1
+            fi
+            case "$value" in *$'\n'*)  # the mask covers only the first line
+              echo "::error::$2 in aiconfig-prod-kv-keys-01 holds more than one line. Next step (AI Config Admin): store it as one line."
+              exit 1;;
+            esac
+            echo "::add-mask::$value"
+            echo "$1=$value" >> "$GITHUB_OUTPUT"
+          }
+          fetch org_estimate_check_token shared-org-estimate-check-token
 
       # This repo, for .github/scripts/ -- the selector helper and the sweep
       # script. Its own default branch, never an event ref.
       - name: Checkout withACX/.github (selector helper + sweep script)
-        if: steps.guard.outputs.has_token == 'true'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
@@ -116,12 +133,11 @@ jobs:
       # needs Contents: Read (ADR-0107); it is org-wide rather than limited to
       # the managed list, so a-cx-ai-config is reachable by construction.
       - name: Checkout a-cx-ai-config (shared board_cli.py, never a copy)
-        if: steps.guard.outputs.has_token == 'true'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: withACX/a-cx-ai-config
           path: _acx-config
-          token: ${{ secrets.ORG_ESTIMATE_CHECK_TOKEN }}
+          token: ${{ steps.keys.outputs.org_estimate_check_token }}
           persist-credentials: false
 
       # Scope resolution through the ONE shared selector. Writes the selected
@@ -130,10 +146,9 @@ jobs:
       # silently cover nothing.
       - name: Resolve the A-CX-managed repo list
         id: select
-        if: steps.guard.outputs.has_token == 'true'
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         with:
-          github-token: ${{ secrets.ORG_ESTIMATE_CHECK_TOKEN }}
+          github-token: ${{ steps.keys.outputs.org_estimate_check_token }}
           script: |
             const fs = require("fs");
             const path = require("path");
@@ -148,9 +163,8 @@ jobs:
             core.setOutput("targets_file", out);
 
       - name: Sweep each managed repo for status:ready issues with no Estimate
-        if: steps.guard.outputs.has_token == 'true'
         env:
-          GH_TOKEN: ${{ secrets.ORG_ESTIMATE_CHECK_TOKEN }}
+          GH_TOKEN: ${{ steps.keys.outputs.org_estimate_check_token }}
           ACX_TARGETS_FILE: ${{ steps.select.outputs.targets_file }}
           ACX_BOARD_CLI: _acx-config/skills/github/scripts/board_cli.py
         run: python3 .github/scripts/acx-estimate-check-sweep.py
