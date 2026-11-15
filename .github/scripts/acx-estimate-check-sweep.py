@@ -1238,7 +1238,7 @@ def sweep_repo(cli_path: str, owner: str, name: str) -> RepoTotals:
               "board, {3} whose board read failed -- and no board data was read "
               "at all, so no Estimate was verified. Likely cause: {4}. Treat "
               "this repo as inconclusive, not as a pass. See "
-              "knowledge/token-registry.md in a-cx-ai-config.".format(
+              "docs/token-runbooks.md in a-cx-ai-config.".format(
                   repo, len(ready), skipped_no_board, unverified_count, cause))
         print("{0}: INCONCLUSIVE -- verified nothing. 0 of {1} status:ready "
               "issue(s) had a readable board Estimate; all {2} went unchecked "
