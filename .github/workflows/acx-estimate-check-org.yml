@@ -59,8 +59,7 @@
 # credential-level scoping so that enrolling a repo stays one reviewed diff in
 # acx-managed-repos.yaml instead of a diff plus an invisible admin-only token
 # edit. The fork exclusion therefore rests on the selector alone -- see ADR-0107
-# D2 for what that costs. See knowledge/token-registry.md in
-# a-cx-ai-config. A run that cannot read the key fails at the fetch step, naming
+# D2 for what that costs. See docs/token-runbooks.md in a-cx-ai-config. A run that cannot read the key fails at the fetch step, naming
 # the repository and the key.
 name: acx estimate check (org-central)
 
