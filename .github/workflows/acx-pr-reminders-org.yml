@@ -18,8 +18,8 @@
 # which the job reads from the AI Config vault as `shared-org-pr-reminder-token`
 # through the shared fetch step (the ai-config-keys skill's
 # references/workflow-fetch.md). A run that cannot read the key fails at the
-# fetch step, naming the repository and the key. See knowledge/token-registry.md
-# (ORG_PR_REMINDER_TOKEN) in a-cx-ai-config.
+# fetch step, naming the repository and the key. See docs/token-runbooks.md
+# (shared-org-pr-reminder-token) in a-cx-ai-config.
 #
 # Delivery still depends on each person's GitHub notification settings and a
 # verified A-CX profile email -- the reminder is a comment that @-mentions the
