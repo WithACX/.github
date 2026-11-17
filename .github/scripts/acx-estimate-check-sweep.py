@@ -1195,7 +1195,7 @@ def sweep_repo(cli_path: str, owner: str, name: str) -> RepoTotals:
             continue
         if number not in on_board:
             # Not on any board -- a board-conditional no-op, the same rule every
-            # other Estimate/Actual write in the pipeline follows.
+            # other Estimate write in the pipeline follows.
             skipped_no_board += 1
             continue
         if number in has_estimate and number not in off_scale:
